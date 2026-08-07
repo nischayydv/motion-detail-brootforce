@@ -25,7 +25,6 @@ from flask import Flask, render_template_string, request, jsonify, g
 # ---------- OCR SETUP (Tesseract) ----------
 try:
     import pytesseract
-    # Tesseract is installed at /usr/bin/tesseract in the Docker image
     pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
     OCR_OK = True
 except ImportError:
@@ -36,10 +35,8 @@ except ImportError:
 def solve_captcha_image(img_bytes):
     """Use Tesseract to read CAPTCHA text."""
     img = Image.open(BytesIO(img_bytes))
-    # Preprocess: grayscale, contrast, threshold
     img = img.convert('L')
     img = img.point(lambda p: 0 if p < 140 else 255, '1')
-    # Tesseract config: single line, only alphanumeric
     custom_config = r'--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
     text = pytesseract.image_to_string(img, config=custom_config)
     cleaned = re.sub(r'[^A-Z0-9]', '', text).strip()
@@ -610,8 +607,10 @@ def close_connection(exception):
     if db is not None:
         db.close()
 
-# ---------- Main ----------
+# ---------- Run on startup (for Gunicorn) ----------
+init_db()
+load_jobs_from_db()
+
+# ---------- Main (for local development) ----------
 if __name__ == '__main__':
-    init_db()
-    load_jobs_from_db()
     app.run(debug=False, host='0.0.0.0', port=5000)
