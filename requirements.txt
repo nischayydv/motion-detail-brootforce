@@ -1,6 +1,6 @@
-Flask==2.3.3
-aiohttp==3.9.0
-beautifulsoup4==4.12.2
-Pillow==12.3.0
-ddddocr==1.5.6
-gunicorn==21.2.0
+Flask>=2.3.3
+aiohttp>=3.9.0
+beautifulsoup4>=4.12.2
+Pillow>=10.0.0
+ddddocr>=1.6.0
+gunicorn>=23.0.0
