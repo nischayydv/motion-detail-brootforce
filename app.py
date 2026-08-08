@@ -9,7 +9,7 @@ Features:
 - ddddocr CAPTCHA solver, configurable delays, retries
 - Flask web dashboard with live logs
 - Stop job functionality
-- DELETE individual jobs and DELETE all jobs
+- DELETE individual jobs and DELETE all jobs (with proper thread termination)
 """
 
 import os
@@ -136,6 +136,7 @@ class BruteJob:
 
         self.thread = None
         self.stop_flag = False
+        self.deleted = False          # mark as deleted to prevent further saves
         self.log_queue = queue.Queue()
         self.total_passwords = len(self.passwords_to_try)
 
@@ -174,7 +175,9 @@ class BruteJob:
         }
 
     def save_to_db(self):
-        """Save or update the job in MongoDB."""
+        """Save or update the job in MongoDB, but skip if deleted."""
+        if self.deleted:
+            return
         try:
             jobs_collection.update_one(
                 {'job_id': self.job_id},
@@ -205,6 +208,7 @@ class BruteJob:
         self.status = 'running'
         self.start_time = datetime.utcnow().isoformat()
         self.stop_flag = False
+        self.deleted = False
         self.save_to_db()
         self.thread = threading.Thread(target=self._run)
         self.thread.daemon = True
@@ -217,10 +221,11 @@ class BruteJob:
         except Exception as e:
             self.log_queue.put(f"❌ Unhandled error: {traceback.format_exc()}")
         finally:
-            if self.status != 'stopped':
-                self.status = 'success' if self.password else 'failed'
-            self.end_time = datetime.utcnow().isoformat()
-            self.save_to_db()
+            if not self.deleted:
+                if self.status != 'stopped':
+                    self.status = 'success' if self.password else 'failed'
+                self.end_time = datetime.utcnow().isoformat()
+                self.save_to_db()
 
     async def _async_bruteforce(self):
         """Main async loop: process passwords from current_index to end."""
@@ -251,6 +256,8 @@ class BruteJob:
 
             tasks = []
             for idx in range(self.current_index, self.total_passwords):
+                if self.stop_flag:
+                    break
                 password = self.passwords_to_try[idx]
                 tasks.append(asyncio.create_task(
                     self._worker(session, user_id, password, semaphore, result_queue, stop_event, log_queue, idx)
@@ -258,16 +265,14 @@ class BruteJob:
 
             found = None
             session_obj = None
-            while True:
+            while not self.stop_flag:
                 try:
                     found, session_obj = await asyncio.wait_for(result_queue.get(), timeout=1.0)
                     break
                 except asyncio.TimeoutError:
                     if all(t.done() for t in tasks):
                         break
-                if stop_event.is_set():
-                    break
-
+            # Cancel remaining tasks
             for t in tasks:
                 t.cancel()
 
@@ -284,10 +289,11 @@ class BruteJob:
                     except Exception as e:
                         log_queue.put_nowait(f"⚠️ Dashboard save error: {e}")
             else:
-                log_queue.put_nowait("❌ No password found in that year.")
+                if not self.stop_flag:
+                    log_queue.put_nowait("❌ No password found in that year.")
 
     async def _worker(self, session, user_id, password, semaphore, result_queue, stop_event, log_queue, idx):
-        if stop_event.is_set():
+        if self.stop_flag or self.deleted:
             return
         async with semaphore:
             self.current_index = idx
@@ -295,7 +301,7 @@ class BruteJob:
             log_queue.put_nowait(f"⏳ Attempting {password}  [{progress_msg}]")
 
             for attempt in range(MAX_RETRIES_PER_PASSWORD):
-                if stop_event.is_set():
+                if self.stop_flag or self.deleted:
                     return
                 try:
                     captcha = await self._fetch_captcha(session, log_queue)
@@ -328,11 +334,12 @@ class BruteJob:
                     log_queue.put_nowait(f"❌ Worker error: {str(e)}")
                     break
 
+            # Update progress after finishing this password
             self.current_index = idx + 1
             self.save_to_db()
             log_queue.put_nowait(f"⏭️  Giving up on {password} after {MAX_RETRIES_PER_PASSWORD} attempts")
 
-            if not stop_event.is_set():
+            if not self.stop_flag and not self.deleted:
                 log_queue.put_nowait(f"⏱️  Waiting {DELAY_BETWEEN_ATTEMPTS}s before next attempt...")
                 await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
 
@@ -792,9 +799,11 @@ def delete_job(job_id):
     """Delete a specific job from MongoDB and in-memory cache."""
     job = jobs.get(job_id)
     if job:
-        # If running, stop it first
+        # If running, stop it
         if job.status == 'running':
             job.stop()
+        # Mark as deleted to prevent further saves
+        job.deleted = True
         # Remove from in-memory dict
         del jobs[job_id]
     # Delete from MongoDB
@@ -807,10 +816,11 @@ def delete_job(job_id):
 @app.route('/jobs/all', methods=['DELETE'])
 def delete_all_jobs():
     """Delete all jobs from MongoDB and in-memory cache."""
-    # Stop all running jobs
+    # Stop all running jobs and mark as deleted
     for job_id, job in list(jobs.items()):
         if job.status == 'running':
             job.stop()
+        job.deleted = True
     # Clear in-memory dict
     jobs.clear()
     # Delete all from MongoDB
