@@ -41,7 +41,7 @@ CAPTCHA_FETCH_TIMEOUT = 8
 LOGIN_TIMEOUT = 12
 POLLING_INTERVAL = 1.5
 
-# MongoDB URI (replace with your own if needed)
+# MongoDB URI
 MONGO_URI = "mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 DB_NAME = "brute_db"
 COLLECTION_NAME = "jobs"
@@ -428,7 +428,7 @@ class BruteJob:
     def stop(self):
         self.stop_flag = True
         self.status = 'stopped'
-        self.save_to_db()
+        self.save_to_db()  # will be skipped if deleted
 
     def get_updates(self):
         new_logs = []
@@ -442,11 +442,11 @@ class BruteJob:
                         self.password = msg.split("Password =")[-1].strip()
                     self.status = 'success'
                 if len(self.logs) % 5 == 0:
-                    self.save_to_db()  # this will skip if deleted
+                    self.save_to_db()  # skipped if deleted
             except:
                 break
         if new_logs:
-            self.save_to_db()  # skip if deleted
+            self.save_to_db()  # skipped if deleted
         return new_logs
 
 
@@ -811,45 +811,55 @@ def delete_job(job_id):
     """Delete a specific job from MongoDB and in-memory cache."""
     job = jobs.get(job_id)
     if job:
-        # If running, stop it
+        # 1. Mark as deleted first – this makes save_to_db() a no-op
+        job.deleted = True
+        # 2. Stop the thread (stop() will call save_to_db() but it will be skipped)
         if job.status == 'running':
             job.stop()
-        # Mark as deleted to prevent further saves
-        job.deleted = True
-        # Clear any pending logs to prevent future get_updates from saving
+        # 3. Clear any pending logs to prevent future saves
         while not job.log_queue.empty():
             try:
                 job.log_queue.get_nowait()
             except:
                 break
-        # Remove from in-memory dict
+        # 4. Remove from in-memory dict
         del jobs[job_id]
-    # Delete from MongoDB
-    result = jobs_collection.delete_one({'job_id': job_id})
-    if result.deleted_count == 0:
-        return jsonify({'error': 'Job not found in database'}), 404
-    return jsonify({'message': 'Job deleted'})
+
+    # 5. Delete from MongoDB with error checking
+    try:
+        result = jobs_collection.delete_one({'job_id': job_id})
+        if result.deleted_count == 0:
+            return jsonify({'error': 'Job not found in database'}), 404
+        print(f"🗑️ Deleted job {job_id} from MongoDB")
+        return jsonify({'message': 'Job deleted'})
+    except Exception as e:
+        print(f"❌ MongoDB delete error for {job_id}: {e}")
+        return jsonify({'error': f'Database error: {str(e)}'}), 500
 
 
 @app.route('/jobs/all', methods=['DELETE'])
 def delete_all_jobs():
     """Delete all jobs from MongoDB and in-memory cache."""
-    # Stop all running jobs and mark as deleted
+    # Mark all as deleted and stop threads
     for job_id, job in list(jobs.items()):
+        job.deleted = True
         if job.status == 'running':
             job.stop()
-        job.deleted = True
-        # Clear log queues
         while not job.log_queue.empty():
             try:
                 job.log_queue.get_nowait()
             except:
                 break
-    # Clear in-memory dict
     jobs.clear()
+
     # Delete all from MongoDB
-    result = jobs_collection.delete_many({})
-    return jsonify({'message': f'Deleted {result.deleted_count} jobs'})
+    try:
+        result = jobs_collection.delete_many({})
+        print(f"🗑️ Deleted {result.deleted_count} jobs from MongoDB")
+        return jsonify({'message': f'Deleted {result.deleted_count} jobs'})
+    except Exception as e:
+        print(f"❌ MongoDB delete all error: {e}")
+        return jsonify({'error': f'Database error: {str(e)}'}), 500
 
 
 @app.route('/jobs')
