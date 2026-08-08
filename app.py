@@ -42,7 +42,7 @@ LOGIN_TIMEOUT = 12
 POLLING_INTERVAL = 1.5
 
 # MongoDB URI
-MONGO_URI = "mongodb+srv://Nischay999:Nischay999@cluster0.5kufo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+MONGO_URI = "mongodb+srv://nischayheroku:Nischay999@cluster0.qsjxwyx.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 DB_NAME = "ny_brute_db"
 COLLECTION_NAME = "jobs"
 
