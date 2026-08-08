@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Motion OTS Batch Brute‑Forcer – Complete Reliable Edition
-- No page refresh on start (even with large lists)
+Motion OTS Batch Brute‑Forcer – Complete Reliable Edition (v2)
+- No page refresh on start (form handling fixed)
 - Live logs for all users simultaneously
 - Smart success detection + 2 CAPTCHA retries
 - Parallel batch processing per user
@@ -479,7 +479,7 @@ def index():
         <h1>⚡ Motion OTS Ultra‑Fast Batch Brute‑Forcer</h1>
         <p>Paste roll numbers (one per line, commas, or ranges) and a year. No page refresh, live logs for all users.</p>
         <p class="help-text">🚀 5 dates at once, 2 captcha retries, 20 users parallel. Wrong passwords skipped instantly.</p>
-        <form id="bruteForm" onsubmit="return false;">
+        <form id="bruteForm">
             <div class="form-group">
                 <label for="user_ids">User IDs</label>
                 <textarea id="user_ids" placeholder="26173000177&#10;26173000179&#10;..."></textarea>
@@ -505,9 +505,12 @@ def index():
     </div>
 </div>
 <script>
-    // Safety: stop form from ever refreshing the page
+    console.log('Script loaded');
+
+    // attach form submit handler (no inline handler)
     document.getElementById('bruteForm').addEventListener('submit', function(e) {
-        e.preventDefault();
+        console.log('Form submit event fired');
+        e.preventDefault();   // stop the page from reloading
         startJob();
     });
 
@@ -521,9 +524,10 @@ def index():
     const jobListDiv = document.getElementById('jobList');
 
     function parseUserIds(raw) {
+        console.log('parseUserIds called with length:', raw.length);
         const ids = new Set();
-        // split by newline, comma, semicolon, or space (trim each part)
-        const parts = raw.split(/[\n,; ]+/);
+        const parts = raw.split(/[\\n,; ]+/);
+        console.log('Parts after split:', parts.length);
         for (let part of parts) {
             part = part.trim();
             if (part === '') continue;
@@ -538,12 +542,16 @@ def index():
                 ids.add(part);
             }
         }
-        return Array.from(ids);
+        const result = Array.from(ids);
+        console.log('Parsed IDs:', result.length);
+        return result;
     }
 
     async function startJob() {
+        console.log('startJob function called');
         const rawIds = document.getElementById('user_ids').value.trim();
         const year = document.getElementById('year').value.trim();
+        console.log('Raw IDs:', rawIds.substring(0, 50), 'Year:', year);
         if (!rawIds || !year) {
             alert('Please fill all fields.');
             return;
@@ -569,8 +577,10 @@ def index():
         formData.append('year', year);
 
         try {
+            console.log('Sending fetch /start');
             const resp = await fetch('/start', { method: 'POST', body: formData });
             const data = await resp.json();
+            console.log('Response:', data);
             if (data.error) {
                 alert(data.error);
                 resetUI();
@@ -582,6 +592,7 @@ def index():
             pollInterval = setInterval(pollStatus, 1500);
             loadJobs();
         } catch (err) {
+            console.error('Fetch error:', err);
             alert('Error starting job: ' + err.message);
             resetUI();
         }
@@ -621,7 +632,7 @@ def index():
                     div.textContent = msg;
                     logsDiv.appendChild(div);
                 });
-                logsDiv.scrollTop = logsDiv.scrollHeight;  // auto-scroll
+                logsDiv.scrollTop = logsDiv.scrollHeight;
             }
             if (data.status === 'success') {
                 statusText.innerText = '✅ Completed';
@@ -699,6 +710,7 @@ def index():
         jobId = null;
     }
     loadJobs();
+    console.log('Initialization complete');
 </script>
 </body>
 </html>
