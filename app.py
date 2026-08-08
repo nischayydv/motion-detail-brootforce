@@ -808,15 +808,15 @@ def stop_job(job_id):
 
 @app.route('/job/<job_id>', methods=['DELETE'])
 def delete_job(job_id):
-    """Delete a specific job from MongoDB and in-memory cache."""
+    """Delete a specific job from MongoDB and in-memory cache with retries."""
     job = jobs.get(job_id)
     if job:
-        # 1. Mark as deleted first – this makes save_to_db() a no-op
+        # 1. Mark as deleted – this makes save_to_db() a no-op
         job.deleted = True
         # 2. Stop the thread (stop() will call save_to_db() but it will be skipped)
         if job.status == 'running':
             job.stop()
-        # 3. Clear any pending logs to prevent future saves
+        # 3. Clear the log queue to prevent any pending saves
         while not job.log_queue.empty():
             try:
                 job.log_queue.get_nowait()
@@ -824,17 +824,34 @@ def delete_job(job_id):
                 break
         # 4. Remove from in-memory dict
         del jobs[job_id]
+        print(f"🗑️ Marked job {job_id} as deleted, removed from memory.")
 
-    # 5. Delete from MongoDB with error checking
-    try:
-        result = jobs_collection.delete_one({'job_id': job_id})
-        if result.deleted_count == 0:
-            return jsonify({'error': 'Job not found in database'}), 404
-        print(f"🗑️ Deleted job {job_id} from MongoDB")
-        return jsonify({'message': 'Job deleted'})
-    except Exception as e:
-        print(f"❌ MongoDB delete error for {job_id}: {e}")
-        return jsonify({'error': f'Database error: {str(e)}'}), 500
+    # 5. Delete from MongoDB with retries and verification
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = jobs_collection.delete_one({'job_id': job_id})
+            if result.deleted_count > 0:
+                print(f"✅ Deleted job {job_id} from MongoDB (attempt {attempt+1})")
+                # Verify it's really gone
+                verify = jobs_collection.find_one({'job_id': job_id})
+                if verify is None:
+                    return jsonify({'message': 'Job deleted successfully'})
+                else:
+                    print(f"⚠️ Job {job_id} still exists after delete, retrying...")
+                    continue
+            else:
+                print(f"⚠️ Job {job_id} not found in MongoDB (attempt {attempt+1})")
+                # It might already be deleted, so we consider it success
+                return jsonify({'message': 'Job already deleted'})
+        except Exception as e:
+            print(f"❌ MongoDB delete attempt {attempt+1} failed for {job_id}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)  # wait before retry
+            else:
+                return jsonify({'error': f'Database error after {max_retries} attempts: {str(e)}'}), 500
+
+    return jsonify({'error': 'Failed to delete job after multiple attempts'}), 500
 
 
 @app.route('/jobs/all', methods=['DELETE'])
@@ -851,15 +868,23 @@ def delete_all_jobs():
             except:
                 break
     jobs.clear()
+    print("🗑️ All jobs marked as deleted and removed from memory.")
 
-    # Delete all from MongoDB
-    try:
-        result = jobs_collection.delete_many({})
-        print(f"🗑️ Deleted {result.deleted_count} jobs from MongoDB")
-        return jsonify({'message': f'Deleted {result.deleted_count} jobs'})
-    except Exception as e:
-        print(f"❌ MongoDB delete all error: {e}")
-        return jsonify({'error': f'Database error: {str(e)}'}), 500
+    # Delete all from MongoDB with retry
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = jobs_collection.delete_many({})
+            print(f"✅ Deleted {result.deleted_count} jobs from MongoDB (attempt {attempt+1})")
+            return jsonify({'message': f'Deleted {result.deleted_count} jobs'})
+        except Exception as e:
+            print(f"❌ MongoDB delete all attempt {attempt+1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+            else:
+                return jsonify({'error': f'Database error after {max_retries} attempts: {str(e)}'}), 500
+
+    return jsonify({'error': 'Failed to delete all jobs'}), 500
 
 
 @app.route('/jobs')
